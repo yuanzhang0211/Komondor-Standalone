@@ -1,0 +1,345 @@
+{
+  "official_commit": "a40896d881bfb377c07a9ccef249cdab52849445",
+  "duration_per_case_s": 0.01,
+  "cases": 40,
+  "passed": 27,
+  "learning_enabled": false,
+  "scope": "Input loading/native short runs only, not original 100s KPI validation or SR/BF PHY validation.",
+  "rows": [
+    {
+      "nodes": "Code/input/validation/basic_scenarios/input_nodes_scenario_1a.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/00_none_input_nodes_scenario_1a"
+    },
+    {
+      "nodes": "Code/input/validation/basic_scenarios/input_nodes_scenario_1a_aggregation.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/01_none_input_nodes_scenario_1a_aggregation"
+    },
+    {
+      "nodes": "Code/input/validation/basic_scenarios/input_nodes_scenario_1b.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/02_none_input_nodes_scenario_1b"
+    },
+    {
+      "nodes": "Code/input/validation/basic_scenarios/input_nodes_scenario_1b_aggregation.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/03_none_input_nodes_scenario_1b_aggregation"
+    },
+    {
+      "nodes": "Code/input/validation/channel_bonding_scenarios/input_nodes_0_pw_bw_validation_20MHz.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/04_none_input_nodes_0_pw_bw_validation_20MHz"
+    },
+    {
+      "nodes": "Code/input/validation/channel_bonding_scenarios/input_nodes_1_pw_bw_validation_40MHz.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/05_none_input_nodes_1_pw_bw_validation_40MHz"
+    },
+    {
+      "nodes": "Code/input/validation/channel_bonding_scenarios/input_nodes_2_pw_bw_validation_80MHz.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/06_none_input_nodes_2_pw_bw_validation_80MHz"
+    },
+    {
+      "nodes": "Code/input/validation/channel_bonding_scenarios/input_nodes_3_pw_bw_validation_160MHz.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/07_none_input_nodes_3_pw_bw_validation_160MHz"
+    },
+    {
+      "nodes": "Code/input/validation/complex_scenarios/input_nodes_scenario_2a.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/08_none_input_nodes_scenario_2a"
+    },
+    {
+      "nodes": "Code/input/validation/complex_scenarios/input_nodes_scenario_2a_aggregation.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/09_none_input_nodes_scenario_2a_aggregation"
+    },
+    {
+      "nodes": "Code/input/validation/complex_scenarios/input_nodes_scenario_2b.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/10_none_input_nodes_scenario_2b"
+    },
+    {
+      "nodes": "Code/input/validation/complex_scenarios/input_nodes_scenario_2b_aggregation.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/11_none_input_nodes_scenario_2b_aggregation"
+    },
+    {
+      "nodes": "Code/input/validation/complex_scenarios/input_nodes_scenario_2c.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/12_none_input_nodes_scenario_2c"
+    },
+    {
+      "nodes": "Code/input/validation/complex_scenarios/input_nodes_scenario_2c_aggregation.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/13_none_input_nodes_scenario_2c_aggregation"
+    },
+    {
+      "nodes": "Code/input/validation/complex_scenarios/input_nodes_scenario_2d.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/14_none_input_nodes_scenario_2d"
+    },
+    {
+      "nodes": "Code/input/validation/complex_scenarios/input_nodes_scenario_2d_aggregation.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/15_none_input_nodes_scenario_2d_aggregation"
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_1.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/16_none_input_nodes_1",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_10.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/17_none_input_nodes_10",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_12.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/18_none_input_nodes_12",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_14.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/19_none_input_nodes_14",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_16.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/20_none_input_nodes_16",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_18.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/21_none_input_nodes_18",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_2.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/22_none_input_nodes_2",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_20.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/23_none_input_nodes_20",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_4.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/24_none_input_nodes_4",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_5.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/25_none_input_nodes_5",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_50.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/26_none_input_nodes_50",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_6.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/27_none_input_nodes_6",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/high_density_scenarios/input_nodes_8.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 255,
+      "passed": false,
+      "evidence": "runs/official_restore_20261103_152816_641096/28_none_input_nodes_8",
+      "reason": "Historical high_density CSV uses legacy destination_id/tpc/cca layout, incompatible with the current positional node loader. Preserved unchanged; no automatic conversion."
+    },
+    {
+      "nodes": "Code/input/validation/spatial_reuse_scenarios/input_nodes_spatial_reuse_1.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/29_none_input_nodes_spatial_reuse_1"
+    },
+    {
+      "nodes": "Code/input/validation/spatial_reuse_scenarios/input_nodes_spatial_reuse_2.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/30_none_input_nodes_spatial_reuse_2"
+    },
+    {
+      "nodes": "Code/input/examples/basic_example/input_nodes.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/31_none_input_nodes"
+    },
+    {
+      "nodes": "Code/input/examples/basic_example/input_nodes_rts_cts.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/32_none_input_nodes_rts_cts"
+    },
+    {
+      "nodes": "Code/input/examples/edca_example/input_nodes_edca_1_single_bss.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/33_none_input_nodes_edca_1_single_bss"
+    },
+    {
+      "nodes": "Code/input/examples/bandwidth_adaptation_example/input_nodes_bw_adapt.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/34_none_input_nodes_bw_adapt"
+    },
+    {
+      "nodes": "Code/input/examples/dso_npca_example/input_nodes_dso.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/35_none_input_nodes_dso"
+    },
+    {
+      "nodes": "Code/input/examples/dso_npca_example/input_nodes_npca.csv",
+      "mode": "none",
+      "mapc": null,
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/36_none_input_nodes_npca"
+    },
+    {
+      "nodes": "Code/input/examples/mapc_example/input_nodes_mapc_example.csv",
+      "mode": "tdma",
+      "mapc": "Code/input/examples/mapc_example/mapc_cotdma_example.csv",
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/37_tdma_input_nodes_mapc_example"
+    },
+    {
+      "nodes": "Code/input/examples/mapc_example/input_nodes_mapc_example.csv",
+      "mode": "sr",
+      "mapc": "Code/input/examples/mapc_example/mapc_cosr_example.csv",
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/38_sr_input_nodes_mapc_example"
+    },
+    {
+      "nodes": "Code/input/examples/mapc_example/input_nodes_mapc_example.csv",
+      "mode": "bf",
+      "mapc": "Code/input/examples/mapc_example/mapc_cobf_example.csv",
+      "returncode": 0,
+      "passed": true,
+      "evidence": "runs/official_restore_20261103_152816_641096/39_bf_input_nodes_mapc_example"
+    }
+  ],
+  "legacy_schema_incompatible": 13,
+  "all_existing_local_checks_passed": true
+}

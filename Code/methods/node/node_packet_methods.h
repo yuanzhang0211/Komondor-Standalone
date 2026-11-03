@@ -1,0 +1,2749 @@
+/* Kom8ndor IEEE 802.11bn Simulator
+ *
+ * Copyright (c) 2026, Universitat Pompeu Fabra.
+ * GNU GENERAL PUBLIC LICENSE
+ * Version 3, 29 June 2007
+ */
+
+/**
+ * node_packet_methods.h: Packet generation, notification dispatch, MCS selection,
+ *   and frame exchange helper method implementations.
+ *
+ * NOTE: This file is an implementation fragment. It must be included from node.h
+ *   after the Node class definition, not included directly.
+ *
+ * Functions defined here:
+ *   - Node::StartTransmission
+ *   - Node::RequestMCS
+ *   - Node::SelectDestination
+ *   - Node::GenerateNotification
+ *   - Node::SendLogicalNack
+ *   - Node::SendResponsePacket
+ *   - Node::InitiateBurstPackets
+ *   - Node::ScheduleTransmission
+ *   - Node::PrepareNewTransmission
+ *   - Node::EndBackoff
+ *   - Node::MyTxFinished
+ */
+
+#ifndef NODE_PACKET_METHODS_H
+#define NODE_PACKET_METHODS_H
+
+void Node :: PublishTdmaQueues() {
+	if (!tdma_pilot.enabled || tdma_pilot.policy == 0) return;
+	int ap=node_params.node_id/3;
+	if (ap<0 || ap>1) throw std::runtime_error("Online TDMA supports AP IDs 0 and 3 only");
+	for (int i=0; i<2; ++i) tdma_network[ap].q[i]=buffer.DestinationSize(tdma_pilot.sta[i]);
+}
+
+void Node :: SelectTdmaForTxop() {
+	if (!tdma_pilot.enabled || tdma_pilot.policy == 0) return;
+	PublishTdmaQueues();
+	int ap=node_params.node_id/3, peer=1-ap;
+	TdmaDecision d=ChooseTdma(tdma_network, tdma_pilot.policy, tdma_pilot.own_us+tdma_pilot.peer_us);
+	tdma_pilot.selected=tdma_pilot.sta[d.sta_index[ap]];
+	tdma_pilot.peer_selected=peer*3+1+d.sta_index[peer];
+	tdma_pilot.own_us=d.budget_us[ap]; tdma_pilot.peer_us=d.budget_us[peer];
+	buffer.selected_destination=tdma_pilot.selected;
+	printf("TDMA_SELECTION;time=%.15f;node=%d;sta=%d;own_us=%d;peer_us=%d;coordinator=%d;role=propose;q0=%d;q1=%d;rate0=%.9f;rate1=%.9f;peer_sta=%d;qa0=%d;qa1=%d;qb0=%d;qb1=%d;ra0=%.9f;ra1=%.9f;rb0=%.9f;rb1=%.9f\n",
+		SimTime(), node_params.node_id, tdma_pilot.selected, tdma_pilot.own_us, tdma_pilot.peer_us,
+		node_params.node_id, tdma_network[ap].q[0], tdma_network[ap].q[1],
+		tdma_network[ap].rate_mbps[0], tdma_network[ap].rate_mbps[1], tdma_pilot.peer_selected,
+		tdma_network[0].q[0], tdma_network[0].q[1], tdma_network[1].q[0], tdma_network[1].q[1],
+		tdma_network[0].rate_mbps[0], tdma_network[0].rate_mbps[1],
+		tdma_network[1].rate_mbps[0], tdma_network[1].rate_mbps[1]);
+}
+
+void Node :: AcceptTdmaIcf(const Notification &n) {
+	if (!tdma_pilot.enabled || tdma_pilot.policy == 0) return;
+	int sta=n.tx_info.tdma_peer_sta;
+	if ((sta != tdma_pilot.sta[0] && sta != tdma_pilot.sta[1])
+			|| n.tx_info.tdma_coord_us <= 0 || n.tx_info.tdma_peer_us <= 0
+			|| n.tx_info.tdma_coord_us+n.tx_info.tdma_peer_us != tdma_pilot.own_us+tdma_pilot.peer_us)
+		throw std::runtime_error("Invalid ICF online STA/grant proposal");
+	tdma_pilot.selected=sta;
+	tdma_pilot.own_us=n.tx_info.tdma_peer_us; tdma_pilot.peer_us=n.tx_info.tdma_coord_us;
+	buffer.selected_destination=sta;
+	printf("TDMA_SELECTION;time=%.15f;node=%d;sta=%d;own_us=%d;peer_us=%d;coordinator=%d;role=accept;q0=%d;q1=%d\n",
+		SimTime(), node_params.node_id, sta, tdma_pilot.own_us, tdma_pilot.peer_us,
+		n.source_id, buffer.DestinationSize(tdma_pilot.sta[0]), buffer.DestinationSize(tdma_pilot.sta[1]));
+}
+
+// The change flag describes successive on-air frames, not transient SR state.
+void Node :: EmitStartTX(Notification &notification) {
+	if (dl_cfend.enabled) dl_cfend.rx_valid=false; // Half-duplex: cannot decode while emitting.
+	if (paper_replay.enabled) {
+		if (notification.packet_type==PACKET_TYPE_ICF) paper_replay.txop_start=SimTime();
+		printf("PAPER_FRAME;time=%.12f;node=%d;dest=%d;type=%d;duration=%.12f;coordinator=%d;grant=%.12f;ac=%d;mapc=%d\n",
+			SimTime(),node_params.node_id,notification.destination_id,notification.packet_type,
+			notification.tx_duration,coordinator_ap_id,mapc_txop_per_ap_data_duration,current_traffic_type,wlan.mapc_enabled);
+		if (notification.packet_type==PACKET_TYPE_DATA && wlan.mapc_enabled
+			&& notification.tx_duration>mapc_txop_per_ap_data_duration+1e-10)
+			throw std::runtime_error("Co-TDMA DATA exceeds allocated grant");
+	}
+	if (paper_replay.enabled && paper_edca.in_access &&
+			(notification.packet_type==PACKET_TYPE_RTS || notification.packet_type==PACKET_TYPE_ICF
+			 || notification.packet_type==PACKET_TYPE_DATA)) paper_edca.attempted=true;
+	if (notification.packet_type == PACKET_TYPE_DATA) {
+		if (paper_replay.enabled) {
+			notification.paper_ids.clear(); notification.paper_payload_bits.clear();
+			notification.paper_flows.clear(); notification.paper_generated.clear();
+			for (int i=0;i<notification.tx_info.num_packets_aggregated;++i) {
+				Notification p=buffer.GetPacketAt(i);
+				notification.paper_ids.push_back(p.packet_id);
+				notification.paper_payload_bits.push_back(p.frame_length);
+				notification.paper_flows.push_back(p.paper_flow);
+				notification.paper_generated.push_back(p.timestamp_generated);
+			}
+			printf("PAPER_DATA;time=%.12f;node=%d;dest=%d;ac=%d;mcs=%d;channels=%d;duration=%.12f;count=%d\n",
+				SimTime(),node_params.node_id,notification.destination_id,current_traffic_type,
+				current_modulation-1,num_channels_tx,notification.tx_duration,
+				notification.tx_info.num_packets_aggregated);
+		}
+		if (tdma_pilot.enabled) {
+			if (notification.destination_id != tdma_pilot.selected)
+				throw std::runtime_error("DATA destination differs from selected STA");
+			if (wlan.mapc_enabled && (mapc_txop_per_ap_data_duration <= 0
+					|| notification.tx_duration > mapc_txop_per_ap_data_duration + 1e-10))
+				throw std::runtime_error("DATA exceeds its TDMA grant");
+			printf("TDMA_DATA;time=%.15f;node=%d;sta=%d;duration_s=%.15f;grant_s=%.15f;count=%d;coordinator=%d\n",
+				SimTime(), node_params.node_id, notification.destination_id,
+				notification.tx_duration, mapc_txop_per_ap_data_duration,
+				notification.tx_info.num_packets_aggregated,
+				coordinator_ap_id == NODE_ID_NONE ? node_params.node_id : coordinator_ap_id);
+		}
+		std::vector<int> ids;
+		for (int i = 0; i < notification.tx_info.num_packets_aggregated; ++i)
+			ids.push_back(buffer.GetPacketAt(i).packet_id);
+		tx_mpdu.begin(ids, notification.destination_id);
+	}
+	notification.tx_info.flag_change_in_tx_power = notification.tx_info.flag_change_in_tx_power
+		|| last_emitted_tx_power_pw != notification.tx_info.tx_power;
+	last_emitted_tx_power_pw = notification.tx_info.tx_power;
+	ObserveAp("tx", &notification);
+	outportSelfStartTX(notification);
+}
+
+bool Node :: ValidateDataAck(int source, int packet_id) {
+	if (!tx_mpdu.matches(source, packet_id)) return false;
+	std::vector<int> prefix;
+	for (int i = 0; i < (int)tx_mpdu.pending.size() && i < buffer.QueueSize(); ++i)
+		prefix.push_back(buffer.GetPacketAt(i).packet_id);
+	if (!tx_mpdu.prefix_matches(prefix))
+		throw std::runtime_error("ACK MPDU IDs differ from queued DATA snapshot");
+	return true;
+}
+
+void Node :: CommitDataAck() {
+	if (paper_replay.enabled) paper_edca.success();
+	int count = (int)tx_mpdu.pending.size();
+	if (tdma_pilot.enabled) {
+		TdmaStaCounts &c=tdma_counts[tdma_pilot.selected];
+		for (int i=0; i<count; ++i) {
+			Notification p=buffer.GetPacketAt(i);
+			if (p.destination_id != tdma_pilot.selected)
+				throw std::runtime_error("ACK deleting packet belonging to other STA");
+			++c.acked;
+			c.sum_delay += SimTime()-p.timestamp_generated;
+			printf("TDMA_ACK;time=%.15f;node=%d;sta=%d;id=%d;delay_s=%.15f\n",
+				SimTime(), node_params.node_id, p.destination_id, p.packet_id,
+				SimTime()-p.timestamp_generated);
+		}
+	}
+	for (int i = 0; i < count; ++i) buffer.DelFirstPacket();
+	if (tdma_pilot.enabled && tdma_pilot.policy > 0) {
+		int ap=node_params.node_id/3;
+		int i=tdma_pilot.selected == tdma_pilot.sta[0] ? 0 : 1;
+		if (count > 0 && data_notification.tx_duration > 0) {
+			double observed=count*12000.0/data_notification.tx_duration/1e6;
+			tdma_network[ap].rate_mbps[i]=.8*tdma_network[ap].rate_mbps[i]+.2*observed;
+			tdma_network[ap].next_rr=1-i;
+		}
+		PublishTdmaQueues();
+	}
+	tx_mpdu.commit();
+	ObserveAp("ack_commit");
+	limited_num_packets_aggregated = 0;
+	printf("FIX_COMMIT;time=%.15f;node=%d;count=%d;unique=%lu;queue=%d\n",
+		SimTime(), node_params.node_id, count, (unsigned long)tx_mpdu.acknowledged.size(), buffer.QueueSize());
+}
+
+/**
+ * Pre-occupancy calls this (triggered-based operation)
+ */
+void Node :: StartTransmission(trigger_t &){
+	// Check STATE_TX_TF first: TF is sent mid-sequence (exchange_sequence[0] is still ICF)
+	if (node_state == STATE_TX_TF) {
+		tf_notification.timestamp = SimTime();
+		EmitStartTX(tf_notification);
+	} else if (exchange_sequence.frame_types[0] == PACKET_TYPE_RTS) {
+		rts_notification.timestamp = SimTime();
+		EmitStartTX(rts_notification);
+	} else if (exchange_sequence.frame_types[0] == PACKET_TYPE_ICF) {
+		icf_notification.timestamp = SimTime();
+		EmitStartTX(icf_notification);
+	} else if (node_state == STATE_TX_DSO_ICF || node_state == STATE_TX_NPCA_ICF) {
+		icf_notification.timestamp = SimTime();
+		EmitStartTX(icf_notification);
+	} else {
+		data_notification.timestamp = SimTime();
+		EmitStartTX(data_notification);
+	}
+}
+
+/**
+ * Request an MCS response from the destination node
+ */
+void Node :: RequestMCS(){
+
+//	LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s RequestMCS() to N%d\n",
+//				SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL1, current_destination_id);
+	// Only one channel required (logically!)
+	// Receiver is able to determine the power received when transmitter uses more than one channel by its own
+	current_left_channel = node_params.current_primary_channel;
+	current_right_channel = node_params.current_primary_channel;
+	// Send request MCS notification
+	Notification request_modulation = GenerateNotification(PACKET_TYPE_MCS_REQUEST, current_destination_id,
+		-1, -1, -1, TX_DURATION_NONE);
+	request_modulation.tx_info.flag_change_in_tx_power = TRUE;
+	outportAskForTxModulation(request_modulation);
+	int ix_aux (current_destination_id - wlan.list_sta_id[0]);	// Auxiliary variable for correcting the node id offset	
+	change_modulation_flag[ix_aux] = FALSE; 	// MCS of receiver is not pending anymore
+	// LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s RequestMCS() END\n", SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL1);
+}
+
+/**
+ * Select the destination node before transmitting
+ */
+void Node :: SelectDestination(){
+	if (paper_replay.enabled) {
+		if (buffer.TotalQueueSize()==0) return;
+		unsigned int chosen=0;
+		if (paper_replay.shared_ll_only && buffer.AcSize(0)>0) {
+			while (buffer.m_queue[chosen].paper_ac!=0) ++chosen;
+		} else if (paper_edca.in_access && buffer.AcSize(paper_edca.active_ac)>0) {
+			while (buffer.m_queue[chosen].paper_ac!=paper_edca.active_ac) ++chosen;
+		} else {
+			for (unsigned int i=1;i<buffer.m_queue.size();++i)
+				if (buffer.m_queue[i].paper_ac<buffer.m_queue[chosen].paper_ac) chosen=i;
+		}
+		const Notification &p=buffer.m_queue[chosen];
+		buffer.selected_destination=current_destination_id=p.destination_id;
+		buffer.selected_ac=current_traffic_type=p.paper_ac;
+		buffer.selected_length=node_params.frame_length=p.frame_length;
+		return;
+	}
+	if (tdma_pilot.enabled) {
+		current_destination_id = tdma_pilot.selected;
+		return;
+	}
+	current_destination_id = PickRandomElementFromArray(wlan.list_sta_id, wlan.num_stas);
+}
+
+/**
+ * Returns 0 if ACK can be suppressed for this DATA destination, 1 if ACK is required.
+ * Suppression activates only when the EWMA success rate has converged above the threshold.
+ */
+static int PredictAckNeeded(int dest_id, int mapc_enabled,
+		const double *ewma, const int *count) {
+	if (!ACK_SUPPRESS_ENABLED) return 1;
+	if (dest_id < 0)           return 1;	// broadcast / no destination
+	if (mapc_enabled)          return 1;	// MAPC paths use custom ACK sequences
+	if (count[dest_id] < ACK_SUPPRESS_MIN_SAMPLES) return 1;
+	return (ewma[dest_id] >= ACK_SUPPRESS_THRESHOLD) ? 0 : 1;
+}
+
+/**
+ * Generate a Notification
+ * @param "packet_type" [type int]: type of packet to be generated
+ * @param "destination_id" [type int]: identifier of the destination node
+ * @param "packet_id" [type int]: identifier of the generated packet
+ * @param "num_packets_aggregated" [type int]: number of data frames to be aggregated
+ * @param "timestamp_generated" [type double]: timestamp at which the notification is generated
+ * @param "tx_duration" [type double]: duration of the transmission
+ * @return "Notification" [type Notification]: generated notification
+ */
+Notification Node :: GenerateNotification(int packet_type, int destination_id, int packet_id,
+	int num_packets_aggregated, double timestamp_generated, double tx_duration) {
+
+	Notification notification;
+
+	notification.packet_id = packet_id;				// ID of the first packet
+	notification.packet_type = packet_type;
+	notification.source_id = node_params.node_id;
+	notification.destination_id = destination_id;
+	notification.tx_duration = tx_duration;
+	notification.tx_info.total_tx_power = current_tx_power;
+
+	if(packet_type == PACKET_TYPE_MCS_REQUEST && first_time_requesting_mcs) {
+		notification.left_channel = node_params.current_primary_channel;
+		notification.right_channel = node_params.current_primary_channel;
+		//first_time_requesting_mcs = FALSE;
+	} else {
+		notification.left_channel = current_left_channel;
+		notification.right_channel = current_right_channel;
+	}
+
+	notification.frame_length = -1;
+	notification.modulation_id = current_modulation;
+	notification.paper_data_bits=node_params.frame_length;
+	notification.paper_ac=current_traffic_type;
+	if (paper_replay.enabled) {
+		notification.modulation_id=8;
+		if (packet_type==PACKET_TYPE_CTS) {
+			notification.paper_data_bits=incoming_notification.paper_data_bits;
+			notification.paper_ac=incoming_notification.paper_ac;
+		}
+	}
+	notification.timestamp = SimTime();
+	notification.timestamp_generated = timestamp_generated;
+
+	// P_tx issue #113
+	num_channels_tx = current_right_channel - current_left_channel + 1;
+
+	if (sr_state.mapc_cosr_active || (sr_state.spatial_reuse_enabled && sr_state.txop_sr_identified)) {
+		notification.tx_info = GenerateTxInfo(num_packets_aggregated, data_duration,
+			ack_duration, rts_duration, cts_duration, sr_state.current_tx_power_sr, num_channels_tx,
+			bits_ofdm_sym, node_params.x, node_params.y, node_params.z,
+		sr_state.flag_change_in_tx_power || (sr_state.mapc_cosr_active ? TRUE : FALSE));
+	} else {
+		notification.tx_info = GenerateTxInfo(num_packets_aggregated, data_duration,
+			ack_duration, rts_duration, cts_duration, current_tx_power, num_channels_tx,
+			bits_ofdm_sym, node_params.x, node_params.y, node_params.z, sr_state.flag_change_in_tx_power);
+	}
+
+	if (dl_cfend.enabled) {
+		if (packet_type==PACKET_TYPE_ACK) notification.tx_info.dl_round=incoming_notification.tx_info.dl_round;
+		else if (packet_type==PACKET_TYPE_DATA || packet_type==PACKET_TYPE_ICR || packet_type==PACKET_TYPE_MU_RTS_TXS)
+			notification.tx_info.dl_round=dl_cfend.round;
+	}
+	// Spatial Reuse parameters
+	notification.tx_info.mapc_time_sharing_fallback = mapc_time_sharing_active;
+	notification.tx_info.bss_color = node_params.bss_color;
+	notification.tx_info.srg = node_params.srg;
+
+	// Beamforming parameters (per-TXOP; updated in PrepareNewTransmission)
+	if (node_params.beamforming_enabled) {
+		notification.tx_info.beamforming_active = BEAMFORMING_ENABLED;
+		notification.tx_info.beam_N_elements    = node_params.beam_N_elements;
+		notification.tx_info.beam_d_spacing     = node_params.beam_d_spacing;
+		notification.tx_info.beam_az_main_rad   = current_beam_az_main_rad;
+		notification.tx_info.beam_num_nulls     = current_beam_num_nulls;
+		notification.tx_info.beam_use_zf        = current_beam_use_zf;
+		for (int _bk = 0; _bk < current_beam_num_nulls; ++_bk)
+			notification.tx_info.beam_null_az_rad[_bk] = current_beam_null_az_rad[_bk];
+
+		/* For Co-BF DATA: recompute null direction directly from current MAPC state.
+		 * This guards against any stale current_beam_num_nulls value by recomputing
+		 * the null at the exact point the notification is generated. */
+		if (packet_type == PACKET_TYPE_DATA && wlan.mapc_enabled
+				&& wlan.mapc_method_ids[mapc_active_group_idx] == CO_BF) {
+			int _nulls = 0;
+			int _zf = 1;
+			double _null_az[MAX_BEAM_NULLS];
+			int _bk;
+			if (coordinator_ap_id == NODE_ID_NONE) {
+				/* Coordinator: null toward each peer AP's associated STA */
+				int _g = mapc_active_group_idx;
+				for (int _p = 0; _p < wlan.mapc_num_peers[_g] && _nulls < MAX_BEAM_NULLS; ++_p) {
+					int _ps = all_node_first_sta_id[wlan.mapc_peer_ap_ids[_g][_p]];
+					if (_ps == NODE_ID_NONE) continue;
+					double _dx = all_node_x[_ps] - node_params.x;
+					double _dy = all_node_y[_ps] - node_params.y;
+					_null_az[_nulls++] = atan2(_dy, _dx);
+				}
+			} else {
+				/* Coordinated AP: null toward coordinator's associated STA */
+				int _cs = all_node_first_sta_id[coordinator_ap_id];
+				if (_cs != NODE_ID_NONE) {
+					double _dx = all_node_x[_cs] - node_params.x;
+					double _dy = all_node_y[_cs] - node_params.y;
+					_null_az[0] = atan2(_dy, _dx);
+					_nulls = 1;
+				}
+			}
+			if (_nulls > 0) {
+				notification.tx_info.beam_num_nulls = _nulls;
+				notification.tx_info.beam_use_zf    = _zf;
+				for (_bk = 0; _bk < _nulls; ++_bk)
+					notification.tx_info.beam_null_az_rad[_bk] = _null_az[_bk];
+				/* Keep current_beam_* in sync so other callers see the same state */
+				current_beam_num_nulls = _nulls;
+				current_beam_use_zf    = _zf;
+				for (_bk = 0; _bk < _nulls; ++_bk)
+					current_beam_null_az_rad[_bk] = _null_az[_bk];
+			}
+		}
+	}
+
+//	// Notify potential changes in the tx power
+//	notification.tx_info.flag_change_in_tx_power = sr_state.flag_change_in_tx_power;
+
+	switch(packet_type){
+
+		case PACKET_TYPE_DATA:{
+			notification.frame_length = node_params.frame_length;
+			notification.tx_info.nav_time = current_nav_time;
+			// Preamble puncturing: embed bitmap so receivers can zero out silent sub-channels.
+			// Control frames (RTS/CTS/ACK/ICF/...) are never punctured — bitmap stays 0.
+			notification.tx_info.pp_punctured_bitmap = pp_punctured_bitmap;
+			// Adaptive ACK suppression: predict whether receiver needs to ACK this frame.
+			// DSO and NPCA use custom ACK-wait states (STATE_WAIT_ACK_DSO/NPCA) that have
+			// no suppressed path on the transmitter side — always require ACK there.
+			if (node_state == STATE_TX_DATA_DSO || node_state == STATE_TX_DATA_NPCA) {
+				notification.tx_info.ack_required = 1;
+			} else {
+				notification.tx_info.ack_required = PredictAckNeeded(
+					destination_id, wlan.mapc_enabled,
+					ack_success_ewma, ack_exchange_count);
+			}
+			break;
+		}
+
+		case PACKET_TYPE_ACK:{
+			notification.frame_length = IEEE_AX_ACK_LENGTH;
+			notification.tx_info.nav_time = current_nav_time;
+			break;
+		}
+
+		case PACKET_TYPE_MCS_REQUEST:{
+			// Do nothing
+			break;
+		}
+
+		case PACKET_TYPE_MCS_RESPONSE:{
+			for(int i = 0; i < NUM_OPTIONS_CHANNEL_LENGTH; ++i) {
+				notification.tx_info.modulation_schemes[i] = mcs_response[i];
+			}
+			break;
+		}
+
+		case PACKET_TYPE_RTS:{
+			notification.frame_length = IEEE_AX_RTS_LENGTH;
+			notification.tx_info.nav_time = current_nav_time;
+			break;
+		}
+
+		case PACKET_TYPE_CTS:{
+			notification.frame_length = IEEE_AX_CTS_LENGTH;
+			notification.tx_info.nav_time = current_nav_time;
+			break;
+		}
+
+		case PACKET_TYPE_ICF:{
+			// MAPC Initial Control Frame — similar size to RTS
+			notification.frame_length = IEEE_AX_RTS_LENGTH;
+			notification.tx_info.nav_time = current_nav_time;
+			break;
+		}
+
+		case PACKET_TYPE_ICR:{
+			// MAPC Initial Control Response — similar size to CTS
+			notification.frame_length = IEEE_AX_CTS_LENGTH;
+			notification.tx_info.nav_time = current_nav_time;
+			break;
+		}
+
+		case PACKET_TYPE_TF:{
+			// MAPC Trigger Frame — similar size to RTS
+			notification.frame_length = IEEE_AX_RTS_LENGTH;
+			notification.tx_info.nav_time = current_nav_time;
+			break;
+		}
+
+		case PACKET_TYPE_MU_RTS_TXS:{
+			// MAPC MU-RTS/TXS — grants coordinated AP TX slot; similar size to RTS
+			notification.frame_length = IEEE_AX_RTS_LENGTH;
+			notification.tx_info.nav_time = current_nav_time;
+			break;
+		}
+
+		case PACKET_TYPE_ACK_TF:{
+			// MAPC ACK Trigger Frame — similar size to RTS/CTS; no NAV needed
+			notification.frame_length = IEEE_AX_RTS_LENGTH;
+			notification.tx_info.nav_time = 0;
+			break;
+		}
+		case PACKET_TYPE_CFEND:{
+			notification.frame_length=160;
+			notification.tx_info.nav_time=0;
+			break;
+		}
+
+		case PACKET_TYPE_NPCA_ICF:{
+			notification.frame_length = IEEE_AX_RTS_LENGTH;
+			notification.tx_info.nav_time = current_nav_time;
+			break;
+		}
+
+		case PACKET_TYPE_NPCA_ICR:{
+			notification.frame_length = IEEE_AX_CTS_LENGTH;
+			notification.tx_info.nav_time = 0;
+			break;
+		}
+
+		case PACKET_TYPE_DSO_ICF:{
+			// DSO Initial Control Frame — similar size to RTS
+			notification.frame_length = IEEE_AX_RTS_LENGTH;
+			notification.tx_info.nav_time = current_nav_time;
+			break;
+		}
+
+		case PACKET_TYPE_DSO_ICR:{
+			// DSO Initial Control Response — similar size to CTS; timer-modelled, no real frame
+			notification.frame_length = IEEE_AX_CTS_LENGTH;
+			notification.tx_info.nav_time = 0;
+			break;
+		}
+
+		default:{
+			printf("ERROR: Packet type unknown\n");
+			exit(EXIT_FAILURE);
+			break;
+		}
+	}
+
+	// Propagate MAPC group ID (0 for standard non-MAPC frames)
+	notification.mapc_group_id = wlan.mapc_group_ids[mapc_active_group_idx];
+	notification.mapc_target_ap_id = NODE_ID_NONE; // default: no specific target
+	notification.mapc_has_data     = TRUE;          // default: assume peer has data
+	if (packet_type == PACKET_TYPE_ICF && tdma_pilot.policy > 0) {
+		notification.tx_info.tdma_peer_sta=tdma_pilot.peer_selected;
+		notification.tx_info.tdma_coord_us=tdma_pilot.own_us;
+		notification.tx_info.tdma_peer_us=tdma_pilot.peer_us;
+	}
+
+	return notification;
+
+}
+
+/**
+ * Send a NACK notification
+ * @param "logical_nack" [type LogicalNack]: logical NACK object to be sent
+ */
+void Node :: SendLogicalNack(LogicalNack logical_nack){
+
+	outportSendLogicalNack(logical_nack);
+
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s NACK of packet type %d sent to a:N%d (and b:N%d) with reason %d\n",
+		SimTime(), node_params.node_id, node_state, LOG_I00, LOG_LVL4, logical_nack.packet_type,
+		logical_nack.node_id_a, logical_nack.node_id_b, logical_nack.loss_reason);
+
+}
+
+/**
+ * Sends the response according to the current state (trigger-based operation)
+ */
+void Node :: SendResponsePacket(trigger_t &){
+
+	switch(node_state){
+
+		case STATE_TX_ACK:{
+
+			LOGS(node_params.save_node_logs,node_logger.file,
+				"%.15f;N%d;S%d;%s;%s SIFS completed after receiving DATA, sending ACK...\n",
+				SimTime(), node_params.node_id, node_state, LOG_I00, LOG_LVL3);
+
+			EmitStartTX(ack_notification);
+
+			// trigger_toFinishTX.Set(SimTime() + current_tx_duration);
+			// time_to_trigger = TruncateDouble(SimTime() + FEMTO_VALUE,12) + current_tx_duration;
+			time_to_trigger = SimTime() + current_tx_duration;
+			trigger_toFinishTX.Set(FixTimeOffset(time_to_trigger,13,12));
+
+			LOGS(node_params.save_node_logs,node_logger.file,
+				"%.15f;N%d;S%d;%s;%s TruncateDouble = %.12f - current_tx_duration = %.12f - trigger_toFinishTX = %.12f\n",
+				SimTime(), node_params.node_id, node_state, LOG_I00, LOG_LVL3,
+				TruncateDouble(SimTime() + FEMTO_VALUE,12), current_tx_duration, trigger_toFinishTX.GetTime());
+
+			break;
+		}
+
+		case STATE_TX_CTS:{
+			LOGS(node_params.save_node_logs,node_logger.file,
+				"%.15f;N%d;S%d;%s;%s SIFS completed after receiving RTS, sending CTS (duration = %f)\n",
+				SimTime(), node_params.node_id, node_state, LOG_I00, LOG_LVL3, current_tx_duration);
+			EmitStartTX(cts_notification);
+
+			time_to_trigger = SimTime() + current_tx_duration;
+			trigger_toFinishTX.Set(FixTimeOffset(time_to_trigger,13,12));
+			break;
+		}
+
+		case STATE_TX_DATA:{
+			LOGS(node_params.save_node_logs,node_logger.file,
+				"%.15f;N%d;S%d;%s;%s SIFS completed after receiving CTS, sending DATA...\n",
+				SimTime(), node_params.node_id, node_state, LOG_I00, LOG_LVL3);
+			EmitStartTX(data_notification);
+			time_to_trigger = SimTime() + current_tx_duration;
+			trigger_toFinishTX.Set(FixTimeOffset(time_to_trigger,13,12));
+			++node_stats.data_packets_sent;
+			++node_stats.data_packets_sent_per_sta[current_destination_id-wlan.list_sta_id[0]];
+
+			// Update performance measurements
+			++performance_report.data_packets_sent;
+			LOGS(node_params.save_node_logs,node_logger.file,
+				"%.15f;N%d;S%d;%s;%s Data TX will be finished at %.15f\n",
+				SimTime(), node_params.node_id, node_state, LOG_I00, LOG_LVL3,
+				trigger_toFinishTX.GetTime());
+			break;
+		}
+
+		case STATE_TX_ICR:{
+			LOGS(node_params.save_node_logs, node_logger.file,
+				"%.15f;N%d;S%d;%s;%s SIFS (+stagger) completed after receiving ICF, sending ICR...\n",
+				SimTime(), node_params.node_id, node_state, LOG_I00, LOG_LVL3);
+			EmitStartTX(icr_notification);
+			time_to_trigger = SimTime() + current_tx_duration;
+			trigger_toFinishTX.Set(FixTimeOffset(time_to_trigger, 13, 12));
+			break;
+		}
+
+		case STATE_TX_ACK_TF:{
+			LOGS(node_params.save_node_logs, node_logger.file,
+				"%.15f;N%d;S%d;%s;%s SIFS completed after DATA, sending ACK TF (broadcast)...\n",
+				SimTime(), node_params.node_id, node_state, LOG_I00, LOG_LVL3);
+			EmitStartTX(ack_tf_notification);
+			time_to_trigger = SimTime() + current_tx_duration;
+			trigger_toFinishTX.Set(FixTimeOffset(time_to_trigger, 13, 12));
+			break;
+		}
+
+		case STATE_TX_RTS:{
+			// MAPC Co-TDMA: sending MU-RTS/TXS after coordinator's own DATA/ACK
+			LOGS(node_params.save_node_logs, node_logger.file,
+				"%.15f;N%d;S%d;%s;%s Sending MU-RTS/TXS to N%d after SIFS\n",
+				SimTime(), node_params.node_id, node_state, LOG_I00, LOG_LVL3,
+				current_destination_id);
+			EmitStartTX(mu_rts_notification);
+			time_to_trigger = SimTime() + current_tx_duration;
+			trigger_toFinishTX.Set(FixTimeOffset(time_to_trigger, 13, 12));
+			break;
+		}
+	}
+}
+
+/**
+ * Helper for EndBackoff: injects burst packets into the buffer
+ */
+void Node :: InitiateBurstPackets(){
+
+	// - Add another bunch of packets to the buffer if TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION
+	//if(node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION && last_transmission_successful) {
+	if(node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION) {
+
+		// - Generate the aggregated frames to be sent in the next transmission
+		for(int i = 0; i < limited_num_packets_aggregated; ++i){
+			new_packet = null_notification;
+			new_packet.timestamp_generated = SimTime();
+			new_packet.packet_id = last_packet_generated_id;
+			buffer.PutPacket(new_packet);
+			++last_packet_generated_id;
+			++node_stats.num_packets_generated;
+			++performance_report.num_packets_generated;
+		}
+
+		// Set "last_transmission_successful" to 0 for the upcoming transmission
+		last_transmission_successful = 0;
+
+	}
+}
+
+/**
+ * Helper for EndBackoff: sets the preoccupancy and toFinishTX triggers.
+ * @param "first_packet_type" [type int]: PACKET_TYPE_RTS (RTS/CTS enabled),
+ *   PACKET_TYPE_DATA (RTS/CTS disabled)
+ */
+void Node :: ScheduleTransmission(int first_packet_type){
+
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s -------------------------------------\n",
+		SimTime(), node_params.node_id, node_state, LOG_D08, LOG_LVL2);
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s TRANSMISSION #%d STARTED\n",
+		SimTime(), node_params.node_id, node_state, LOG_D08, LOG_LVL2,
+		node_stats.rts_cts_sent);
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s -------------------------------------\n",
+		SimTime(), node_params.node_id, node_state, LOG_D08, LOG_LVL2);
+
+	if (first_packet_type == PACKET_TYPE_RTS) {
+		LOGS(node_params.save_node_logs,node_logger.file,
+			"%.15f;N%d;S%d;%s;%s Transmission of RTS #%d started\n",
+			SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL3, rts_notification.packet_id);
+		++node_stats.rts_cts_sent;
+		++node_stats.rts_cts_sent_per_sta[current_destination_id-wlan.list_sta_id[0]];
+		++performance_report.rts_cts_sent;
+	} else if (first_packet_type == PACKET_TYPE_ICF || first_packet_type == PACKET_TYPE_DSO_ICF
+			|| first_packet_type == PACKET_TYPE_NPCA_ICF) {
+		LOGS(node_params.save_node_logs,node_logger.file,
+			"%.15f;N%d;S%d;%s;%s Transmission of ICF #%d started\n",
+			SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL3, icf_notification.packet_id);
+		++node_stats.rts_cts_sent;
+		++performance_report.rts_cts_sent;
+		// ICF is broadcast — no per-STA breakdown (rts_cts_sent_per_sta not updated)
+	} else if (first_packet_type == PACKET_TYPE_TF) {
+		LOGS(node_params.save_node_logs,node_logger.file,
+			"%.15f;N%d;S%d;%s;%s Transmission of TF #%d started\n",
+			SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL3, tf_notification.packet_id);
+	} else if (first_packet_type == PACKET_TYPE_MU_RTS_TXS) {
+		LOGS(node_params.save_node_logs,node_logger.file,
+			"%.15f;N%d;S%d;%s;%s Transmission of MU-RTS/TXS #%d started\n",
+			SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL3, mu_rts_notification.packet_id);
+	} else {
+		LOGS(node_params.save_node_logs,node_logger.file,
+			"%.15f;N%d;S%d;%s;%s Transmission of DATA #%d started\n",
+			SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL3, data_notification.packet_id);
+		// 2-way path (no RTS/CTS): count DATA TX here since SendResponsePacket is never called
+		++node_stats.data_packets_sent;
+		++node_stats.data_packets_sent_per_sta[current_destination_id - wlan.list_sta_id[0]];
+		++performance_report.data_packets_sent;
+	}
+
+	// ------------------------------------------------------------------------
+	// Sergio on 07 Dec 2017: add transmission time to spectrum utilization
+	for(int c = current_left_channel; c <= current_right_channel; ++c){
+		node_stats.total_time_channel_busy_per_channel[c] += current_tx_duration;
+	}
+	// ------------------------------------------------------------------------
+
+	// Send preoccupancy trigger and trigger to finish transmission
+	time_to_trigger = SimTime() + time_rand_value;
+	trigger_preoccupancy.Set(FixTimeOffset(time_to_trigger,13,12));
+	if (first_packet_type == PACKET_TYPE_RTS) {
+		rts_notification.tx_info.preoccupancy_duration = time_rand_value;
+	} else if (first_packet_type == PACKET_TYPE_ICF || first_packet_type == PACKET_TYPE_DSO_ICF
+			|| first_packet_type == PACKET_TYPE_NPCA_ICF) {
+		icf_notification.tx_info.preoccupancy_duration = time_rand_value;
+	} else if (first_packet_type == PACKET_TYPE_TF) {
+		tf_notification.tx_info.preoccupancy_duration = time_rand_value;
+	} else if (first_packet_type == PACKET_TYPE_MU_RTS_TXS) {
+		mu_rts_notification.tx_info.preoccupancy_duration = time_rand_value;
+	} else {
+		data_notification.tx_info.preoccupancy_duration = time_rand_value;
+	}
+
+	time_to_trigger = SimTime() + current_tx_duration;
+
+	trigger_toFinishTX.Set(FixTimeOffset(time_to_trigger,13,12));
+	trigger_start_backoff.Cancel();	// Safety instruction
+}
+
+/**
+ * Helper for EndBackoff: selects destination, MCS, builds the first-frame notification
+ */
+void Node :: PrepareNewTransmission() {
+	if (paper_replay.enabled && buffer.TotalQueueSize()==0) { RestartNode(FALSE); return; }
+
+	// Identify the channel range to TX in depending on the channel bonding scheme and free channels
+	int ix_mcs_per_node (current_destination_id - wlan.list_sta_id[0]);
+
+	// Get the transmission channels
+	current_left_channel = GetFirstOrLastTrueElemOfArray(FIRST_TRUE_IN_ARRAY,
+		channels_for_tx, NUM_CHANNELS_KOMONDOR);
+	current_right_channel = GetFirstOrLastTrueElemOfArray(LAST_TRUE_IN_ARRAY,
+		channels_for_tx, NUM_CHANNELS_KOMONDOR);
+
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s Transmission is possible in range: %d - %d\n",
+		SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL3, current_left_channel, current_right_channel);
+
+	int previous_num_channels = num_channels_tx;
+	num_channels_tx = current_right_channel - current_left_channel + 1;
+	++node_stats.num_trials_tx_per_num_channels[(int)log2(num_channels_tx)];
+	int ix_num_channels_used (log2(num_channels_tx));
+
+	// Preamble puncturing: count active (non-punctured) channels for throughput scaling.
+	// For non-PP scenarios channels_for_tx[] has no gaps, so the count equals num_channels_tx.
+	int num_active_channels_tx = 0;
+	{
+		int _c;
+		for (_c = 0; _c < NUM_CHANNELS_KOMONDOR; ++_c)
+			if (channels_for_tx[_c] == TRUE) ++num_active_channels_tx;
+		if (num_active_channels_tx == 0) num_active_channels_tx = num_channels_tx;
+	}
+
+	if(previous_num_channels != num_channels_tx) sr_state.flag_change_in_tx_power = TRUE;
+
+	// Get the current modulation according to the channels selected for transmission
+	//int ix_mcs_per_node (current_destination_id - wlan.list_sta_id[0]);
+	current_modulation = mcs_per_node[ix_mcs_per_node][ix_num_channels_used];
+	if (paper_replay.enabled) current_modulation=8; // MCS7, enum uses MCS+1
+	// Fallback: MCS not yet exchanged (first NPCA/DSO attempt before EndBackoff fires)
+	if (current_modulation <= 0) current_modulation = MODULATION_BPSK_1_2;
+
+	// ********************************************************
+	// Flexible packet aggregation
+
+	// Coordinator ICF: clear stale per-AP budget from previous coordinated role
+	if (wlan.mapc_enabled && coordinator_ap_id == NODE_ID_NONE
+			&& exchange_sequence.frame_types[0] == PACKET_TYPE_ICF) {
+		mapc_txop_per_ap_data_duration = 0.0;
+		mapc_icr_requested_duration    = 0.0;
+	}
+
+	//  - Delete / flush packets from the previous transmission
+    const bool preserved_full_buffer = node_params.traffic_model==TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION
+        && wlan.mapc_enabled && coordinator_ap_id==NODE_ID_NONE
+        && exchange_sequence.frame_types[0]!=PACKET_TYPE_ICF;
+	if (node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION && !preserved_full_buffer) {
+		// Full-buffer: flush ALL stale packets before each new TXOP so that packets
+		// added by the previous InitiateBurstPackets call (which uses the pre-TXOP-cap
+		// lnpa, e.g. ~40) do not accumulate when the TXOP cap allows fewer transmissions
+		// (e.g. 4 for VO). Without this flush, VO/VI build a multi-second backlog because
+		// ~40 packets are added per call but only 4 (VO) or 8 (VI) are deleted.
+		// Exception: MAPC coordinator DATA path — buffer was pre-filled at ICF time;
+		// preserve those packets so the DATA lnpa is computed correctly.
+		while (buffer.QueueSize() > 0) {
+			++full_buffer_replaced; // Saturated source refresh, distinct from overflow or ACK.
+			buffer.DelFirstPacket();
+		}
+	}
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s Data packet/s removed from buffer (queue: %d/%d).\n",
+		SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3,
+		buffer.QueueSize(), PACKET_BUFFER_SIZE);
+
+	// - Number of packets to be aggregated: min(current buffer size, max num packets aggregated)
+	if(buffer.QueueSize() > node_params.max_num_packets_aggregated
+            || (node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION && !preserved_full_buffer)){
+		current_num_packets_aggregated = node_params.max_num_packets_aggregated;
+	} else {
+		current_num_packets_aggregated = buffer.QueueSize();
+	}
+
+	// data rate depending on CB and streams: Nsc * ym * yc * SUSS
+	// Preamble puncturing: GetNumberSubcarriers uses the full range (for correct MCS bandwidth class),
+	// then scaled down by the active-to-range ratio to reflect punctured sub-channels.
+	bits_ofdm_sym =  GetNumberSubcarriers(num_channels_tx) *
+		Mcs_array::modulation_bits[current_modulation-1] *
+		Mcs_array::coding_rates[current_modulation-1] *
+		IEEE_AX_SU_SPATIAL_STREAMS *
+		((double)num_active_channels_tx / (double)num_channels_tx);
+
+	// Update the number of packets to aggregate (just in case that the max PPDU is exceeded with the current MCS)
+	limited_num_packets_aggregated = FindMaximumPacketsAggregated
+		(current_num_packets_aggregated, node_params.frame_length, bits_ofdm_sym);
+
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s Num. of packets to aggregate: %d/%d (last_transmission_successful=%d)\n",
+		SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL4,
+		limited_num_packets_aggregated, node_params.max_num_packets_aggregated, last_transmission_successful);
+
+	// Guard: abort if the buffer is empty for non-full-buffer traffic (e.g., Poisson).
+	// Transmitting 0 packets wastes the TXOP and produces invalid frame durations.
+	if (limited_num_packets_aggregated == 0
+			&& (node_params.traffic_model != TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION || preserved_full_buffer)) {
+		LOGS(node_params.save_node_logs, node_logger.file,
+			"%.15f;N%d;S%d;%s;%s Buffer empty; aborting TX and restarting (no CW increase).\n",
+			SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3);
+		RestartNode(FALSE);
+		return;
+	}
+
+	// TODO: ADD TRANSMISSION DELAY
+
+	// ********************************************************
+	// Buffer fill timing:
+	//   MAPC coordinator + full-buffer model (99): fill at ICF time (before TXOP announcement)
+	//   All other cases: fill at DATA preparation time (non-ICF path)
+	if (wlan.mapc_enabled && coordinator_ap_id == NODE_ID_NONE
+			&& node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION) {
+		if (exchange_sequence.frame_types[0] == PACKET_TYPE_ICF) {
+			InitiateBurstPackets(); // Pre-fill before ICF so lnpa is known at TXOP start
+		}
+		// For MAPC coordinator DATA path: buffer was pre-filled at ICF time; skip
+	} else {
+		// Standard, coordinated AP, or non-full-buffer MAPC: fill before DATA
+		if (exchange_sequence.frame_types[0] != PACKET_TYPE_ICF) {
+			InitiateBurstPackets();
+		}
+	}
+	// ********************************************************
+
+	// Compute all packets durations (RTS, CTS, DATA and ACK) and NAV time
+	ComputeFramesDuration(&rts_duration, &cts_duration, &data_duration, &ack_duration,
+		num_channels_tx, current_modulation, limited_num_packets_aggregated, node_params.frame_length, bits_ofdm_sym);
+
+	// TXOP split: save budget at ICF time; cap DATA duration to per-AP allocation
+	if (wlan.mapc_enabled && coordinator_ap_id == NODE_ID_NONE
+			&& exchange_sequence.frame_types[0] == PACKET_TYPE_ICF) {
+		// Coordinator ICF path: record full data_duration as TXOP budget
+		mapc_txop_data_budget = data_duration;
+		if (paper_replay.enabled) {
+			paper_replay.own_need=data_duration;
+			paper_replay.txop_limit=ComputeTxopLimit(paper_edca.active_ac);
+			double max_ack=ComputeAckTxTime80211ax(64,IEEE_BITS_OFDM_SYM_LEGACY);
+			double overhead=2*rts_duration+cts_duration+2*max_ack+6*SIFS;
+			mapc_txop_data_budget=std::max(0.0,paper_replay.txop_limit-overhead);
+			data_duration=mapc_txop_data_budget;
+		}
+		if (tdma_pilot.enabled) {
+			mapc_txop_data_budget = tdma_pilot.own_s()+tdma_pilot.peer_s();
+			data_duration = mapc_txop_data_budget;
+		}
+	} else if (wlan.mapc_enabled && wlan.mapc_txop_splits[mapc_active_group_idx] == TXOP_SPLIT_EQUAL
+			&& mapc_txop_per_ap_data_duration > 0.0
+			&& exchange_sequence.frame_types[0] != PACKET_TYPE_ICF) {
+		// DATA path (coordinator or coordinated AP): reduce lnpa to fit within budget
+		while (limited_num_packets_aggregated > 1 && data_duration > mapc_txop_per_ap_data_duration) {
+			--limited_num_packets_aggregated;
+			ComputeFramesDuration(&rts_duration, &cts_duration, &data_duration, &ack_duration,
+				num_channels_tx, current_modulation, limited_num_packets_aggregated, node_params.frame_length, bits_ofdm_sym);
+		}
+        if (!paper_replay.enabled && !tdma_pilot.enabled
+                && wlan.mapc_method_ids[mapc_active_group_idx]==CO_TDMA
+                && data_duration>mapc_txop_per_ap_data_duration+1e-10) {
+            // A short native queue may contain just one MPDU. Half a DATA budget
+            // cannot then hold even its preamble. Decline sharing for this round;
+            // do not send an over-budget MPDU or invent extra reserved airtime.
+            if (coordinator_ap_id==NODE_ID_NONE) {
+                mapc_peer_has_data=FALSE;
+                double solo_limit=IEEE_AX_MAX_PPDU_DURATION-rts_duration-cts_duration-ack_duration-2*SIFS;
+                mapc_txop_per_ap_data_duration=std::max(0.0,std::min(mapc_txop_data_budget,solo_limit));
+                ObserveAp("solo_fallback");
+            }
+            if (data_duration>mapc_txop_per_ap_data_duration+1e-10) {
+                printf("TDMA_NO_FIT;time=%.12f;node=%d;single_mpdu_s=%.12f;grant_s=%.12f\n",
+                    SimTime(),node_params.node_id,data_duration,mapc_txop_per_ap_data_duration);
+                ObserveAp("no_fit");
+                RestartNode(FALSE); return;
+            }
+        }
+		if (paper_replay.enabled && data_duration > mapc_txop_per_ap_data_duration+1e-10) {
+			// The actual DCB width can shrink after ICF/ICR. Never transmit an MPDU
+			// that no longer fits the advertised allocation; retain it for retry.
+			printf("PAPER_NO_FIT;time=%.12f;node=%d;single_mpdu=%.12f;grant=%.12f;channels=%d\n",
+				SimTime(),node_params.node_id,data_duration,mapc_txop_per_ap_data_duration,num_channels_tx);
+			RestartNode(FALSE); return;
+		}
+		if (tdma_pilot.enabled && data_duration > mapc_txop_per_ap_data_duration + 1e-10) {
+			printf("TDMA_INFEASIBLE;time=%.15f;node=%d;single_mpdu_s=%.15f;grant_s=%.15f\n",
+				SimTime(), node_params.node_id, data_duration, mapc_txop_per_ap_data_duration);
+			throw std::runtime_error("One MPDU does not fit TDMA grant; no oversize transmission allowed");
+		}
+		// Co-BF/Co-SR: if AP has fewer packets than the TXOP slot, pad data_duration
+		// to the allocated value so both APs' DATA frames end at the same time.
+		// Co-TDMA is excluded (sequential slots; each AP uses its natural duration).
+		if (wlan.mapc_method_ids[mapc_active_group_idx] != CO_TDMA && !mapc_time_sharing_active
+				&& data_duration < mapc_txop_per_ap_data_duration) {
+			data_duration = mapc_txop_per_ap_data_duration;
+		}
+	}
+
+	// EDCA TXOP limit: reduce aggregation to fit within the per-AC TXOP_Limit.
+	// Only active for BACKOFF_EDCA and ACs with TXOP_Limit > 0 (VO, VI).
+	// ACs with TXOP_Limit = 0 (BE, BK) mean "single PPDU per channel access" per
+	// IEEE 802.11-2020 §10.22.2.2 — their A-MPDU size is already bounded by
+	// IEEE_AX_MAX_PPDU_DURATION (applied above), which is the correct behaviour.
+	if (node_params.backoff_type == BACKOFF_EDCA) {
+		double edca_txop_limit = ComputeTxopLimit(current_traffic_type);
+		if (edca_txop_limit > 0.0) {
+			while (limited_num_packets_aggregated > 1 && data_duration > edca_txop_limit) {
+				--limited_num_packets_aggregated;
+				ComputeFramesDuration(&rts_duration, &cts_duration, &data_duration, &ack_duration,
+					num_channels_tx, current_modulation, limited_num_packets_aggregated,
+					node_params.frame_length, bits_ofdm_sym);
+			}
+		}
+	}
+
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s Transmitting (N_agg = %d) in %d channels using modulation %d (%.0f bits per OFDM symbol ---> %.2f Mbps) \n",
+		SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL4, limited_num_packets_aggregated,
+		(int) pow(2, ix_num_channels_used), current_modulation, bits_ofdm_sym,
+		bits_ofdm_sym/IEEE_AX_OFDM_SYMBOL_GI32_DURATION * pow(10,-6));
+
+	if(sr_state.mapc_cosr_active || (sr_state.spatial_reuse_enabled && sr_state.txop_sr_identified)) {
+		LOGS(node_params.save_node_logs,node_logger.file,
+			"%.15f;N%d;S%d;%s;%s Using tx power = %f dBm \n",
+			SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL4,
+			ConvertPower(PW_TO_DBM, sr_state.current_tx_power_sr));
+	} else {
+		LOGS(node_params.save_node_logs,node_logger.file,
+			"%.15f;N%d;S%d;%s;%s Using tx power = %f dBm \n",
+			SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL4,
+			ConvertPower(PW_TO_DBM, current_tx_power));
+	}
+
+
+	// --- Per-TXOP beamforming: update beam direction and null directions ---
+	if (node_params.beamforming_enabled) {
+		double _bf_dx, _bf_dy;
+		// Main beam: steer toward current destination
+		_bf_dx = all_node_x[current_destination_id] - node_params.x;
+		_bf_dy = all_node_y[current_destination_id] - node_params.y;
+		current_beam_az_main_rad = atan2(_bf_dy, _bf_dx);
+		current_beam_num_nulls = 0;
+		current_beam_use_zf = 0;	/* default: projection (standalone BF) */
+
+		if (wlan.mapc_enabled && coordinator_ap_id == NODE_ID_NONE
+				&& wlan.mapc_method_ids[mapc_active_group_idx] == CO_BF) {
+			// MAPC coordinator: null toward each peer AP's associated STA
+			int _g = mapc_active_group_idx;
+			for (int _p = 0; _p < wlan.mapc_num_peers[_g]
+					&& current_beam_num_nulls < MAX_BEAM_NULLS; ++_p) {
+				int _peer_sta = all_node_first_sta_id[wlan.mapc_peer_ap_ids[_g][_p]];
+				if (_peer_sta == NODE_ID_NONE) continue;
+				_bf_dx = all_node_x[_peer_sta] - node_params.x;
+				_bf_dy = all_node_y[_peer_sta] - node_params.y;
+				current_beam_null_az_rad[current_beam_num_nulls++] = atan2(_bf_dy, _bf_dx);
+			}
+			// Co-BF: use ZF precoding for simultaneous transmissions
+			current_beam_use_zf = 1;
+		} else if (wlan.mapc_enabled && coordinator_ap_id != NODE_ID_NONE
+				&& wlan.mapc_method_ids[mapc_active_group_idx] == CO_BF) {
+			// MAPC coordinated AP: null toward coordinator's associated STA
+			int _coord_sta = all_node_first_sta_id[coordinator_ap_id];
+			if (_coord_sta != NODE_ID_NONE) {
+				_bf_dx = all_node_x[_coord_sta] - node_params.x;
+				_bf_dy = all_node_y[_coord_sta] - node_params.y;
+				current_beam_null_az_rad[0] = atan2(_bf_dy, _bf_dx);
+				current_beam_num_nulls = 1;
+			}
+			// Co-BF: use ZF precoding for simultaneous transmissions
+			current_beam_use_zf = 1;
+		}
+	}
+
+	// B13: DSO prohibited on NPCA channel (SS37.18.4 rule 11)
+	if (npca_on_npca_channel) dso_tx_flag = 0;
+
+	// NPCA DATA phase
+	if (node_state == STATE_TX_DATA_NPCA) {
+		double _npca_pre = (double)(NPCA_ICF_DURATION_US + NPCA_SWITCH_TIME_US
+			+ NPCA_ICR_DURATION_US) * MICRO_VALUE + 2.0 * SIFS;
+		double _npca_cap = IEEE_AX_MAX_PPDU_DURATION - _npca_pre - SIFS - ack_duration;
+		if (_npca_cap < 0.0) _npca_cap = 0.0;
+		while (limited_num_packets_aggregated > 1 && data_duration > _npca_cap) {
+			--limited_num_packets_aggregated;
+			ComputeFramesDuration(&rts_duration, &cts_duration, &data_duration, &ack_duration,
+				num_channels_tx, current_modulation, limited_num_packets_aggregated,
+				node_params.frame_length, bits_ofdm_sym);
+		}
+		current_tx_duration = data_duration;
+		current_nav_time = ComputeNavTime(STATE_TX_DATA, rts_duration, cts_duration,
+			data_duration, ack_duration, SIFS);
+		current_nav_time = FixTimeOffset(current_nav_time, 13, 12);
+		time_rand_value = 0;
+		int _rand_npca (2 + rand() % (MAX_NUM_RAND_TIME-2));
+		time_rand_value = (double)_rand_npca * MAX_DIFFERENCE_SAME_TIME/MAX_NUM_RAND_TIME;
+		time_rand_value = FixTimeOffset(time_rand_value, 13, 12);
+		current_nav_time = current_nav_time - time_rand_value;
+		Notification _fp_npca = buffer.GetFirstPacket();
+		data_notification = GenerateNotification(PACKET_TYPE_DATA, current_destination_id,
+			_fp_npca.packet_id, limited_num_packets_aggregated,
+			_fp_npca.timestamp_generated, current_tx_duration);
+		sr_state.flag_change_in_tx_power = FALSE;
+		ScheduleTransmission(PACKET_TYPE_DATA);
+	} else
+
+	// DSO DATA phase: channels_for_tx set to DSO subband by DsoIcrTimeout
+	if (node_state == STATE_TX_DATA_DSO) {
+
+		// Apply DSO data duration cap (ICF + wait overhead already elapsed)
+		double _dso_pre = (double)(DSO_ICF_DURATION_US + DSO_SWITCH_TIME_US
+			+ DSO_ICR_DURATION_US) * MICRO_VALUE + 2.0 * SIFS;
+		double _dso_cap = IEEE_AX_MAX_PPDU_DURATION - _dso_pre - SIFS - ack_duration;
+		if (_dso_cap < 0.0) _dso_cap = 0.0;
+		while (limited_num_packets_aggregated > 1 && data_duration > _dso_cap) {
+			--limited_num_packets_aggregated;
+			ComputeFramesDuration(&rts_duration, &cts_duration, &data_duration, &ack_duration,
+				num_channels_tx, current_modulation, limited_num_packets_aggregated,
+				node_params.frame_length, bits_ofdm_sym);
+		}
+
+		current_tx_duration = data_duration;
+		current_nav_time = ComputeNavTime(STATE_TX_DATA, rts_duration, cts_duration,
+			data_duration, ack_duration, SIFS);
+		current_nav_time = FixTimeOffset(current_nav_time, 13, 12);
+
+		time_rand_value = 0;
+		int _rand_dso (2 + rand() % (MAX_NUM_RAND_TIME-2));
+		time_rand_value = (double)_rand_dso * MAX_DIFFERENCE_SAME_TIME/MAX_NUM_RAND_TIME;
+		time_rand_value = FixTimeOffset(time_rand_value, 13, 12);
+		current_nav_time = current_nav_time - time_rand_value;
+
+		Notification _fp_dso = buffer.GetFirstPacket();
+		data_notification = GenerateNotification(PACKET_TYPE_DATA, current_destination_id,
+			_fp_dso.packet_id, limited_num_packets_aggregated,
+			_fp_dso.timestamp_generated, current_tx_duration);
+		data_notification.tx_info.dso_tx = 1;
+		sr_state.flag_change_in_tx_power = FALSE;
+		ScheduleTransmission(PACKET_TYPE_DATA);
+
+	} else if (exchange_sequence.frame_types[0] == PACKET_TYPE_NPCA_ICF) {
+
+		// NPCA ICF phase (SS37.18.4 rule 6): send ICF on NPCA subband
+		node_state = STATE_TX_NPCA_ICF;
+		current_tx_duration = (double)NPCA_ICF_DURATION_US * MICRO_VALUE;
+		// Channel range already set by EndNpcaBackoff
+		{
+			int _nl = current_left_channel, _nr = current_right_channel;
+			int _npca_nch = _nr - _nl + 1;
+			int _npca_mcs = mcs_per_node[ix_mcs_per_node][(int)log2((double)_npca_nch)];
+			if (_npca_mcs <= 0) _npca_mcs = MODULATION_BPSK_1_2;
+			double _npca_bpsy = GetNumberSubcarriers(_npca_nch)
+				* Mcs_array::modulation_bits[_npca_mcs - 1]
+				* Mcs_array::coding_rates[_npca_mcs - 1]
+				* IEEE_AX_SU_SPATIAL_STREAMS;
+			ComputeFramesDuration(&rts_duration, &cts_duration, &data_duration, &ack_duration,
+				_npca_nch, _npca_mcs, limited_num_packets_aggregated,
+				node_params.frame_length, _npca_bpsy);
+		}
+		double _npca_pre2 = (double)(NPCA_SWITCH_TIME_US + NPCA_ICR_DURATION_US) * MICRO_VALUE;
+		current_nav_time = SIFS + _npca_pre2 + SIFS + data_duration + SIFS + ack_duration;
+		current_nav_time = FixTimeOffset(current_nav_time, 13, 12);
+		time_rand_value = 0;
+		int _rand_npca_icf (2 + rand() % (MAX_NUM_RAND_TIME-2));
+		time_rand_value = (double)_rand_npca_icf * MAX_DIFFERENCE_SAME_TIME/MAX_NUM_RAND_TIME;
+		time_rand_value = FixTimeOffset(time_rand_value, 13, 12);
+		current_nav_time = current_nav_time - time_rand_value;
+		// ICF broadcast on full BSS BW so STA detects it on primary channel
+		int _npca_icf_left  = current_left_channel;
+		int _npca_icf_right = current_right_channel;
+		current_left_channel  = node_params.min_channel_allowed;
+		current_right_channel = node_params.max_channel_allowed;
+		icf_notification = GenerateNotification(PACKET_TYPE_NPCA_ICF, current_destination_id,
+			last_packet_generated_id, limited_num_packets_aggregated,
+			SimTime(), current_tx_duration);
+		current_left_channel  = _npca_icf_left;
+		current_right_channel = _npca_icf_right;
+		sr_state.flag_change_in_tx_power = FALSE;
+		ScheduleTransmission(PACKET_TYPE_NPCA_ICF);
+
+	} else if (exchange_sequence.frame_types[0] == PACKET_TYPE_DSO_ICF) {
+
+		// DSO ICF phase: send ICF on full BSS BW, carry DSO subband info
+		node_state = STATE_TX_DSO_ICF;
+		current_tx_duration = (double)DSO_ICF_DURATION_US * MICRO_VALUE;
+
+		// Recompute data/ack durations for the DSO secondary subband width (narrower than AP BW)
+		{
+			int _dso_nch = dso_channels_for_tx[1] - dso_channels_for_tx[0] + 1;
+			int _dso_mcs = mcs_per_node[ix_mcs_per_node][(int)log2((double)_dso_nch)];
+			double _dso_bpsy = GetNumberSubcarriers(_dso_nch)
+				* Mcs_array::modulation_bits[_dso_mcs - 1]
+				* Mcs_array::coding_rates[_dso_mcs - 1]
+				* IEEE_AX_SU_SPATIAL_STREAMS;
+			ComputeFramesDuration(&rts_duration, &cts_duration, &data_duration, &ack_duration,
+				_dso_nch, _dso_mcs, limited_num_packets_aggregated,
+				node_params.frame_length, _dso_bpsy);
+		}
+
+		// NAV: ICR wait + SIFS + data + SIFS + ack (data_duration now reflects DSO subband BW)
+		double _dso_pre2 = (double)(DSO_SWITCH_TIME_US + DSO_ICR_DURATION_US) * MICRO_VALUE;
+		current_nav_time = SIFS + _dso_pre2 + SIFS + data_duration + SIFS + ack_duration;
+		current_nav_time = FixTimeOffset(current_nav_time, 13, 12);
+
+		time_rand_value = 0;
+		int _rand_icf (2 + rand() % (MAX_NUM_RAND_TIME-2));
+		time_rand_value = (double)_rand_icf * MAX_DIFFERENCE_SAME_TIME/MAX_NUM_RAND_TIME;
+		time_rand_value = FixTimeOffset(time_rand_value, 13, 12);
+		current_nav_time = current_nav_time - time_rand_value;
+
+		// ICF covers full BSS BW so other nodes can set NAV
+		current_left_channel  = node_params.min_channel_allowed;
+		current_right_channel = node_params.max_channel_allowed;
+
+		icf_notification = GenerateNotification(PACKET_TYPE_DSO_ICF, current_destination_id,
+			last_packet_generated_id, limited_num_packets_aggregated,
+			SimTime(), current_tx_duration);
+		icf_notification.tx_info.dso_tx           = 1;
+		icf_notification.tx_info.dso_subband_left  = dso_channels_for_tx[0];
+		icf_notification.tx_info.dso_subband_right = dso_channels_for_tx[1];
+		sr_state.flag_change_in_tx_power = FALSE;
+		ScheduleTransmission(PACKET_TYPE_DSO_ICF);
+
+	} else if (exchange_sequence.frame_types[0] == PACKET_TYPE_RTS) {
+
+		// 4-way handshake: start with RTS
+		node_state = STATE_TX_RTS;
+		current_tx_duration = rts_duration;
+
+		// Compute the NAV time
+		current_nav_time = ComputeNavTime(node_state, rts_duration, cts_duration, data_duration, ack_duration, SIFS);
+		current_nav_time = FixTimeOffset(current_nav_time,13,12); // Update the NAV time according to the time offsets
+
+		/*
+		 * IMPORTANT: to avoid synchronization problems in Slotted BO, we put a
+		 * random time epsilon trigger before sending the channel occupancy notification.
+		 * E.g. If two APs A and B finish their BO at the very same time, both A and B will
+		 * find the channel free and will pick the corresponding channels accordingly. This
+		 * way we are able to capture slotted BO collisions.
+		 */
+		time_rand_value = 0;
+		int rand_number_rts (2 + rand() % (MAX_NUM_RAND_TIME-2));	// in [2, MAX_NUM_RAND_TIME]
+		time_rand_value = (double) rand_number_rts * MAX_DIFFERENCE_SAME_TIME/MAX_NUM_RAND_TIME; // in [FEMTO_SECOND, MAX_DIFFERENCE_SAME_TIME]
+		// Sergio on 28/09/2017
+		// time_rand_value = RoundToDigits(time_rand_value, 15);
+		time_rand_value = FixTimeOffset(time_rand_value,13,12);
+		current_nav_time = current_nav_time - time_rand_value;
+
+		// Generate the RTS notification
+		Notification first_packet_buffer = buffer.GetFirstPacket();
+
+		rts_notification = GenerateNotification(PACKET_TYPE_RTS, current_destination_id,
+			first_packet_buffer.packet_id, limited_num_packets_aggregated,
+			first_packet_buffer.timestamp_generated, current_tx_duration);
+
+		// Reset the flag that indicates whether the tx power changed or not
+		sr_state.flag_change_in_tx_power = FALSE;
+
+		ScheduleTransmission(PACKET_TYPE_RTS);
+
+	} else if (exchange_sequence.frame_types[0] == PACKET_TYPE_ICF) {
+
+		// MAPC exchange (Co-TDMA or Co-BF/Co-SR): start with ICF
+		// ICF duration is approximated by rts_duration (both are short control frames)
+		node_state = STATE_TX_ICF;
+		++node_stats.num_icf_tx;
+		current_tx_duration = rts_duration;
+
+		// NAV covers the full MAPC exchange; computed by ComputeNavTime STATE_TX_ICF case
+		current_nav_time = ComputeNavTime(STATE_TX_ICF, rts_duration, cts_duration, data_duration, ack_duration, SIFS);
+		if (tdma_pilot.enabled)
+			current_nav_time = 2*rts_duration+cts_duration+mapc_txop_data_budget+2*ack_duration+6*SIFS;
+		current_nav_time = FixTimeOffset(current_nav_time,13,12);
+
+		time_rand_value = 0;
+		int rand_number_icf (2 + rand() % (MAX_NUM_RAND_TIME-2));
+		time_rand_value = (double) rand_number_icf * MAX_DIFFERENCE_SAME_TIME/MAX_NUM_RAND_TIME;
+		time_rand_value = FixTimeOffset(time_rand_value,13,12);
+		current_nav_time = current_nav_time - time_rand_value;
+
+		// Generate the ICF notification
+		// ICF is a control frame; data buffer is managed at DATA preparation phase
+		icf_notification = GenerateNotification(PACKET_TYPE_ICF, current_destination_id,
+			last_packet_generated_id, limited_num_packets_aggregated,
+			SimTime(), current_tx_duration);
+
+		// Broadcast ICF to the MAPC group (all nodes update NAV)
+		if (dl_cfend.enabled && wlan.mapc_method_ids[mapc_active_group_idx]==CO_TDMA) {
+			dl_cfend.round=DlRound();
+			dl_cfend.round.owner=node_params.node_id;
+			dl_cfend.round.peer=mapc_selected_peer_id;
+			dl_cfend.round.epoch=SimTime();
+			dl_cfend.round.end=SimTime()+paper_replay.txop_limit;
+			icf_notification.tx_info.dl_round=dl_cfend.round;
+			// Reserve the actual TXOP ceiling; later CF-End may truncate it.
+			icf_notification.tx_info.nav_time=paper_replay.txop_limit;
+		}
+		icf_notification.destination_id = NODE_ID_MAPC_BROADCAST;
+		icf_notification.mapc_group_id  = wlan.mapc_group_ids[mapc_active_group_idx];
+		// Tag which coordinated AP should respond with ICR (round-robin)
+		icf_notification.mapc_target_ap_id = mapc_selected_peer_id;
+
+		// Reset the flag that indicates whether the tx power changed or not
+		sr_state.flag_change_in_tx_power = FALSE;
+
+		ScheduleTransmission(PACKET_TYPE_ICF);
+
+	} else {
+
+		// 2-way handshake: start with DATA directly
+		node_state = STATE_TX_DATA;
+		current_tx_duration = data_duration;
+
+		// Compute the NAV time
+		current_nav_time = ComputeNavTime(node_state, rts_duration, cts_duration, data_duration, ack_duration, SIFS);
+		current_nav_time = FixTimeOffset(current_nav_time,13,12);
+
+		time_rand_value = 0;
+		// Co-SR simultaneous DATA: suppress random jitter so both APs fire at the exact
+		// same simulation time. The random offset exists only to break backoff ties, which
+		// is not relevant here since neither AP is contending — both start immediately.
+		if (!(wlan.mapc_enabled && sr_state.mapc_cosr_active)) {
+			int rand_number_data (2 + rand() % (MAX_NUM_RAND_TIME-2));
+			time_rand_value = (double) rand_number_data * MAX_DIFFERENCE_SAME_TIME/MAX_NUM_RAND_TIME;
+			time_rand_value = FixTimeOffset(time_rand_value,13,12);
+		}
+		current_nav_time = current_nav_time - time_rand_value;
+
+		// Generate the DATA notification
+		Notification first_packet_buffer_data = buffer.GetFirstPacket();
+
+		data_notification = GenerateNotification(PACKET_TYPE_DATA, current_destination_id,
+			first_packet_buffer_data.packet_id, limited_num_packets_aggregated,
+			first_packet_buffer_data.timestamp_generated, current_tx_duration);
+
+		// Reset the flag that indicates whether the tx power changed or not
+		sr_state.flag_change_in_tx_power = FALSE;
+
+		ScheduleTransmission(PACKET_TYPE_DATA);
+	}
+}
+
+/**
+ * Called when backoff finishes (triggered-based operation)
+ */
+void Node :: EndBackoff(trigger_t &){
+	if (paper_replay.enabled) {
+		paper_edca.win(SimTime());
+		current_traffic_type=paper_edca.active_ac;
+		wlan.mapc_enabled=paper_replay.original_mapc && ComputeTxopLimit(current_traffic_type)>0;
+		printf("PAPER_EDCA_WIN;time=%.12f;node=%d;ac=%d;cw=%d;virtual_collisions=%lu\n",
+			SimTime(),node_params.node_id,current_traffic_type,paper_edca.cw[current_traffic_type],
+			paper_edca.internal_collisions);
+	}
+
+	LOGS(node_params.save_node_logs,node_logger.file, "\n----------------------------------------------------------\n");
+	LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s EndBackoff()\n",
+			SimTime(), node_params.node_id, node_state, LOG_F00, LOG_LVL1);
+
+	// Spatial Reuse: apply SR TX power/PD parameters if an SR TXOP was identified
+	ApplySRParametersAtBackoffEnd();
+
+	// Select MAPC or standard frame exchange sequence
+	if (wlan.mapc_enabled) {
+		// Round-robin over groups: select which group to coordinate this TXOP
+		mapc_active_group_idx = mapc_coordinator_group_rr % wlan.num_mapc_groups;
+		mapc_time_sharing_active = false;
+		++mapc_coordinator_group_rr;
+		if (wlan.mapc_method_ids[mapc_active_group_idx] == CO_TDMA) {
+			exchange_sequence = IEEE_802_11_COTDMA;
+		} else if (wlan.mapc_method_ids[mapc_active_group_idx] == CO_BF
+				|| wlan.mapc_method_ids[mapc_active_group_idx] == CO_SR) {
+			exchange_sequence = IEEE_802_11_COBF_COSR;
+		} else {
+			printf("ERROR: MAPC method not found.\n");
+		}
+		// Declare this node as coordinator for the upcoming TXOP
+		coordinator_ap_id = NODE_ID_NONE;
+		num_coordinated_aps = wlan.mapc_num_peers[mapc_active_group_idx];
+		coordinated_ap_ids.resize(num_coordinated_aps);
+		for (int i = 0; i < num_coordinated_aps; ++i)
+			coordinated_ap_ids[i] = wlan.mapc_peer_ap_ids[mapc_active_group_idx][i];
+		// Round-robin: select which coordinated AP to invite this TXOP
+		mapc_selected_peer_id = coordinated_ap_ids[mapc_current_peer_idx[mapc_active_group_idx] % num_coordinated_aps];
+		LOGS(node_params.save_node_logs, node_logger.file,
+			"%.15f;N%d;S%d;%s;%s MAPC: selected peer N%d (round-robin idx %d)\n",
+			SimTime(), node_params.node_id, node_state, LOG_F02, LOG_LVL2,
+			mapc_selected_peer_id, mapc_current_peer_idx[mapc_active_group_idx] % num_coordinated_aps);
+	} else {
+		exchange_sequence = node_params.rts_cts_enabled ? IEEE_802_11_RTS_CTS : IEEE_802_11_NO_RTS_CTS;
+	}
+	mapc_seq_pos = 0;
+	mapc_icr_received_count = 0;
+	SelectTdmaForTxop();
+
+	ObserveAp("access_won");
+	// Sergio on 26th June 2018:
+	// - Compute average BO waiting time
+	node_stats.sum_waiting_time = node_stats.sum_waiting_time + SimTime() - node_stats.timestamp_new_trial_started;
+	++node_stats.num_average_waiting_time_measurements;
+
+	// Update the performance_report
+	performance_report.sum_waiting_time += SimTime() - node_stats.timestamp_new_trial_started;
+	++performance_report.num_waiting_time_measurements;
+	if (SimTime() - node_stats.timestamp_new_trial_started > performance_report.max_waiting_time) {
+		performance_report.max_waiting_time = SimTime() - node_stats.timestamp_new_trial_started;
+	}
+	if (SimTime() - node_stats.timestamp_new_trial_started < performance_report.min_waiting_time) {
+		performance_report.min_waiting_time = SimTime() - node_stats.timestamp_new_trial_started;
+	}
+
+	// Measurements in the last part of the simulation
+	if (SimTime() > (node_params.simulation_time_komondor - node_stats.last_measurements_window)) {
+		node_stats.last_sum_waiting_time = node_stats.last_sum_waiting_time + SimTime() - node_stats.timestamp_new_trial_started;
+		++node_stats.last_num_average_waiting_time_measurements;
+	}
+
+	// Cancel NAV TIMEOUT trigger
+	trigger_NAV_timeout.Cancel();
+
+	// Cancel RECOVER CTS trigger for safety
+	trigger_recover_cts_timeout.Cancel();
+
+	// Check if MCS has been already defined for every potential receiver
+	for(int n = 0; n < wlan.num_stas; ++n) {
+		current_destination_id = wlan.list_sta_id[n];
+		// Receive the possible MCS to be used for each number of channels
+		if (change_modulation_flag[n]) {
+			LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s Requesting MCS to N%d\n",
+				SimTime(), node_params.node_id, node_state, LOG_F02, LOG_LVL2, current_destination_id);
+			RequestMCS();
+		}
+	}
+
+	LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s Allowed LEFT/RIGHT: %d - %d\n",
+		SimTime(), node_params.node_id, node_state, LOG_F02, LOG_LVL2, node_params.min_channel_allowed, node_params.max_channel_allowed);
+
+	// Pick one receiver from the pool of potential receivers
+	SelectDestination();
+
+	LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s Trying to start TX to STA N%d\n",
+		SimTime(), node_params.node_id, node_state, LOG_F02, LOG_LVL2, current_destination_id);
+
+	// Identify free channels
+	++node_stats.num_tx_init_tried;
+
+	// Compute effective TX channel range: cap AP's range to the destination STA's declared bandwidth.
+	// Exceptions that always use the full AP range:
+	//   (a) Broadcast frames (destination_id < 0).
+	//   (b) MAPC coordinator: the first frame after EndBackoff is an ICF, which is a broadcast
+	//       control frame sent at full BSS bandwidth. The coordinator's own DATA-phase channel
+	//       selection is re-done in ProceedAfterIcr / MyTxFinished with the STA cap applied there.
+	int eff_min_channel = node_params.min_channel_allowed;
+	int eff_max_channel = node_params.max_channel_allowed;
+	{
+		int is_mapc_coordinator = (wlan.mapc_enabled && coordinator_ap_id == NODE_ID_NONE);
+		// DSO: skip STA bandwidth cap — DSO uses the full AP range for CCA + ICF;
+		// the secondary subband is chosen per-STA in the DSO scan block below.
+		int is_dso = (dso_enabled && !wlan.mapc_enabled);
+		if (!is_mapc_coordinator && !is_dso && current_destination_id >= 0) {
+			int sta_min_ch, sta_max_ch;
+			wlan.GetStaChannelBounds(current_destination_id, &sta_min_ch, &sta_max_ch);
+			if (sta_min_ch >= 0 && sta_min_ch > eff_min_channel) eff_min_channel = sta_min_ch;
+			if (sta_max_ch >= 0 && sta_max_ch < eff_max_channel) eff_max_channel = sta_max_ch;
+		}
+	}
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s Effective TX range for N%d: [%d, %d]\n",
+		SimTime(), node_params.node_id, node_state, LOG_F02, LOG_LVL3,
+		current_destination_id, eff_min_channel, eff_max_channel);
+
+	// CCA + channel selection via pluggable channel access policy (default: CSMA/CA).
+	// SR uses a relaxed PD threshold when an OBSS TXOP opportunity was identified.
+	double effective_pd = (sr_state.spatial_reuse_enabled && sr_state.txop_sr_identified)
+		? sr_state.current_obss_pd_threshold : current_pd;
+	pp_punctured_bitmap = 0;	// Reset; PP_CheckAndSelectChannels will set if puncturing occurs
+	channel_access_policy.checkAndSelectChannels(
+		node_params.current_primary_channel, node_params.pifs_activated,
+		channels_free, eff_min_channel, eff_max_channel,
+		&channel_power, effective_pd, timestamp_channel_becomes_free, SimTime(), PIFS,
+		node_params.current_dcb_policy, NUM_CHANNELS_KOMONDOR, channel_aggregation_cca_model,
+		channels_for_tx, &pp_punctured_bitmap);
+
+	LOGS(node_params.save_node_logs,node_logger.file,
+		"%.15f;N%d;S%d;%s;%s Power sensed per channel [dBm]: ",
+		SimTime(), node_params.node_id, node_state, LOG_E18, LOG_LVL3);
+
+	PrintOrWriteChannelPower(WRITE_LOG, node_params.save_node_logs, node_params.print_node_logs, node_logger,
+		&channel_power);
+
+	LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s Channels founds free (mind PIFS if activated): ",
+		SimTime(), node_params.node_id, node_state, LOG_F02, LOG_LVL3);
+
+	PrintOrWriteChannelsFree(WRITE_LOG, node_params.save_node_logs, node_params.print_node_logs, node_logger,
+		channels_free);
+
+	LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s Channels for transmitting: ",
+		SimTime(), node_params.node_id, node_state, LOG_F02, LOG_LVL2);
+
+	PrintOrWriteChannelForTx(WRITE_LOG, node_params.save_node_logs, node_params.print_node_logs, node_logger,
+		channels_for_tx);
+
+	// DSO: post-backoff secondary subband redirect
+	dso_tx_flag = 0;
+	if (dso_enabled && !wlan.mapc_enabled && channels_for_tx[0] != TX_NOT_POSSIBLE) {
+		int _n_stas = wlan.num_stas;
+		for (int _i = 0; _i < _n_stas; ++_i) {
+			int _idx = (dso_rr_idx + _i) % _n_stas;
+			int _cand = wlan.list_sta_id[_idx];
+			if (node_params.traffic_model != TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION
+					&& buffer.QueueSize() == 0)
+				break;
+			int _s_min, _s_max;
+			wlan.GetStaChannelBounds(_cand, &_s_min, &_s_max);
+			if (_s_min < 0) _s_min = node_params.min_channel_allowed;
+			if (_s_max < 0) _s_max = node_params.max_channel_allowed;
+			// Only attempt DSO if STA bandwidth is strictly smaller than AP bandwidth
+			int _sta_bw = _s_max - _s_min + 1;
+			int _ap_bw  = node_params.max_channel_allowed - node_params.min_channel_allowed + 1;
+			if (_sta_bw >= _ap_bw) continue;
+			GetTxChannelsByDSO(dso_channels_for_tx, &dso_tx_flag,
+					node_params.min_channel_allowed, node_params.max_channel_allowed,
+					node_params.current_primary_channel,
+					_s_min, _s_max, &channel_power, current_pd);
+			if (dso_tx_flag == 1) {
+				current_destination_id = _cand;
+				dso_rr_idx = (_idx + 1) % _n_stas;
+				exchange_sequence = IEEE_802_11_DSO;
+				LOGS(node_params.save_node_logs, node_logger.file,
+					"%.15f;N%d;S%d;%s;%s DSO: selected N%d on secondary [%d,%d]\n",
+					SimTime(), node_params.node_id, node_state, LOG_F02, LOG_LVL2,
+					_cand, dso_channels_for_tx[0], dso_channels_for_tx[1]);
+				break;
+			}
+		}
+	}
+
+	// Act according to possible (not possible) transmission
+	if(channels_for_tx[0] != TX_NOT_POSSIBLE) {
+		//&& current_modulation != MODULATION_FORBIDDEN){	// Transmission IS POSSIBLE
+		PrepareNewTransmission();
+	} else {	// Transmission IS NOT POSSIBLE, compute a new backoff.
+		AbortInitialTransmission();
+	}
+	// LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s EndBackoff() END\n", SimTime(), node_params.node_id, node_state, LOG_F01, LOG_LVL1);
+};
+
+/**
+ * Called when own transmission is finished (triggered-based operation)
+ */
+void Node :: MyTxFinished(trigger_t &){
+
+//	LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s MyTxFinished()\n",
+//			SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL1);
+
+	switch(node_state){
+
+		case STATE_TX_RTS:{
+
+			if (wlan.mapc_enabled && (wlan.mapc_method_ids[mapc_active_group_idx] == CO_TDMA || mapc_time_sharing_active)) {
+				// MAPC Co-TDMA: MU-RTS/TXS finished — advance round-robin and restart coordinator
+				Notification notification = GenerateNotification(PACKET_TYPE_MU_RTS_TXS, current_destination_id,
+					mu_rts_notification.packet_id, mu_rts_notification.tx_info.num_packets_aggregated,
+					mu_rts_notification.timestamp_generated, TX_DURATION_NONE);
+				// Propagate per-AP allocation so HandleFinishTX_StateRxMuRts can cap AP_B's DATA
+				notification.tx_info.mapc_allocated_data_duration =
+					mu_rts_notification.tx_info.mapc_allocated_data_duration;
+				outportSelfFinishTX(notification);
+				LOGS(node_params.save_node_logs, node_logger.file,
+					"%.15f;N%d;S%d;%s;%s MU-RTS/TXS #%d tx finished. Advancing round-robin and restarting.\n",
+					SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2,
+					notification.packet_id);
+				++mapc_current_peer_idx[mapc_active_group_idx];
+			++node_stats.num_mu_rts_tx;
+				if (dl_cfend.enabled && dl_cfend.round.valid()) HoldDlPeer();
+				else RestartNode(FALSE);
+			} else {
+				// Normal RTS: wait for CTS
+				// Set CTS timeout and change state to STATE_WAIT_CTS
+				Notification notification = GenerateNotification(PACKET_TYPE_RTS, current_destination_id,
+					rts_notification.packet_id, limited_num_packets_aggregated,
+					rts_notification.timestamp_generated, TX_DURATION_NONE);
+
+				outportSelfFinishTX(notification);
+
+				// Time out = T_c = T_RTS + SIFS + T_CTS minus T_RTS (already txed)
+				time_to_trigger = SimTime() + SIFS + notification.tx_info.cts_duration;
+				trigger_CTS_timeout.Set(FixTimeOffset(time_to_trigger,13,12));
+				node_state = STATE_WAIT_CTS;
+
+				LOGS(node_params.save_node_logs,node_logger.file,
+					"%.15f;N%d;S%d;%s;%s RTS #%d tx finished. Waiting for CTS until %.12f\n",
+					SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2,
+					notification.packet_id, trigger_CTS_timeout.GetTime());
+			}
+
+			break;
+		}
+
+		case STATE_TX_CTS:{		// Wait for Data
+
+			Notification notification = GenerateNotification(PACKET_TYPE_CTS, current_destination_id,
+				cts_notification.packet_id, cts_notification.tx_info.num_packets_aggregated,
+				cts_notification.timestamp_generated, TX_DURATION_NONE);
+
+			outportSelfFinishTX(notification);
+
+			// Set CTS timeout and change state to STATE_WAIT_DATA
+			time_to_trigger = SimTime() + SIFS + TIME_OUT_EXTRA_TIME;
+			trigger_DATA_timeout.Set(FixTimeOffset(time_to_trigger,13,12));
+			node_state = STATE_WAIT_DATA;
+
+			LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s CTS %d tx finished. Waiting for DATA...\n",
+				SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2, notification.packet_id);
+
+			break;
+		}
+
+		case STATE_TX_DATA:{ 	// Change state to STATE_WAIT_ACK (or ACK TF phase for Co-BF/Co-SR)
+
+			Notification notification = GenerateNotification(PACKET_TYPE_DATA, current_destination_id,
+				data_notification.packet_id, data_notification.tx_info.num_packets_aggregated,
+				data_notification.timestamp_generated, TX_DURATION_NONE);
+			if (paper_replay.enabled) {
+				notification.paper_ids=data_notification.paper_ids;
+				notification.paper_payload_bits=data_notification.paper_payload_bits;
+				notification.paper_flows=data_notification.paper_flows;
+				notification.paper_generated=data_notification.paper_generated;
+			}
+
+			// Carry the ack_required flag from the start notification so the finish
+			// notification seen by HandleFinishTX_StateRxData matches exactly.
+			notification.tx_info.ack_required = data_notification.tx_info.ack_required;
+
+			// Co-BF/Co-SR: tag DATA finish notification with MAPC group so STAs know
+			// to wait for the ACK TF instead of auto-ACKing after SIFS.
+			int cobf_cosr = wlan.mapc_enabled
+				&& !mapc_time_sharing_active
+				&& (wlan.mapc_method_ids[mapc_active_group_idx] == CO_BF
+					|| wlan.mapc_method_ids[mapc_active_group_idx] == CO_SR);
+			if (cobf_cosr) {
+				notification.mapc_group_id = wlan.mapc_group_ids[mapc_active_group_idx];
+				// Tell the receiving STA which ACK-TF timing to expect (see field comment
+				// in notification.h) -- fast coordinator path vs. delayed sequential path.
+				notification.tx_info.mapc_is_coordinator_tx = (coordinator_ap_id == NODE_ID_NONE) ? 1 : 0;
+			}
+
+			outportSelfFinishTX(notification);
+
+			if (cobf_cosr && coordinator_ap_id == NODE_ID_NONE) {
+				// COORDINATOR: send ACK TF after SIFS to trigger simultaneous ACKs from both STAs
+				current_tx_duration = rts_duration;  // ACK TF is a short control frame
+				ack_tf_notification = GenerateNotification(PACKET_TYPE_ACK_TF, NODE_ID_MAPC_BROADCAST,
+					data_notification.packet_id, 0, SimTime(), current_tx_duration);
+				ack_tf_notification.mapc_group_id = wlan.mapc_group_ids[mapc_active_group_idx];
+				node_state = STATE_TX_ACK_TF;
+				time_to_trigger = SimTime() + SIFS;
+				trigger_SIFS.Set(FixTimeOffset(time_to_trigger, 13, 12));
+				LOGS(node_params.save_node_logs, node_logger.file,
+					"%.15f;N%d;S%d;%s;%s DATA %d tx done (Co-BF/SR coordinator). Sending ACK TF after SIFS.\n",
+					SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2, notification.packet_id);
+			} else if (cobf_cosr && coordinator_ap_id != NODE_ID_NONE) {
+				// The ACK phase is SEQUENTIAL, not simultaneous (Coordinating AP first, then Coordinated AP)
+				current_tx_duration = rts_duration;  // ACK TF is a short control frame
+				ack_tf_notification = GenerateNotification(PACKET_TYPE_ACK_TF, NODE_ID_MAPC_BROADCAST,
+					data_notification.packet_id, 0, SimTime(), current_tx_duration);
+				ack_tf_notification.mapc_group_id = wlan.mapc_group_ids[mapc_active_group_idx];
+				node_state = STATE_TX_ACK_TF;
+				time_to_trigger = SimTime() + SIFS + rts_duration + SIFS + ack_duration + SIFS;
+				trigger_SIFS.Set(FixTimeOffset(time_to_trigger, 13, 12));
+				LOGS(node_params.save_node_logs, node_logger.file,
+					"%.15f;N%d;S%d;%s;%s DATA %d tx done (Co-BF/SR coordinated). Sending own ACK TF after coordinator's ACK sequence.\n",
+					SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2, notification.packet_id);
+			} else if (data_notification.tx_info.ack_required == 0) {
+				if (!ValidateDataAck(current_destination_id, data_notification.packet_id))
+					throw std::runtime_error("ACK-suppressed DATA has no pending MPDU transaction");
+				// ACK suppressed (assume DATA delivered, return to contention)
+				last_transmission_successful = 1;
+				++node_stats.data_packets_acked;
+				++node_stats.data_packets_acked_per_sta[current_destination_id - wlan.list_sta_id[0]];
+				++performance_report.data_packets_acked;
+				int _acked_frames = (int)tx_mpdu.pending.size();
+				if (_acked_frames > buffer.QueueSize()) {
+					_acked_frames = buffer.QueueSize();
+				}
+				for (int _i = 0; _i < _acked_frames; ++_i) {
+					++node_stats.data_frames_acked;
+					++node_stats.data_frames_acked_per_sta[current_destination_id - wlan.list_sta_id[0]];
+					++performance_report.data_frames_acked;
+					++node_stats.num_delay_measurements;
+					double _pkt_ts = buffer.GetPacketAt(_i).timestamp_generated;
+					node_stats.sum_delays = node_stats.sum_delays + (SimTime() - _pkt_ts);
+					if (_pkt_ts > (node_params.simulation_time_komondor - node_stats.last_measurements_window)) {
+						++node_stats.last_data_frames_acked;
+						++node_stats.last_num_delay_measurements;
+						node_stats.last_sum_delays = node_stats.last_sum_delays + (SimTime() - _pkt_ts);
+					}
+					performance_report.sum_delays = performance_report.sum_delays + (SimTime() - _pkt_ts);
+					++performance_report.num_delay_measurements;
+					if ((SimTime() - _pkt_ts) > performance_report.max_delay)
+						performance_report.max_delay = SimTime() - _pkt_ts;
+					if ((SimTime() - _pkt_ts) < performance_report.min_delay)
+						performance_report.min_delay = SimTime() - _pkt_ts;
+				}
+				CommitDataAck();
+				HandleContentionWindow(
+					node_params.cw_adaptation, RESET_CW, &ca_state.deterministic_bo_active,
+					&ca_state.current_cw_min, &ca_state.current_cw_max, &ca_state.cw_stage_current,
+					node_params.cw_min_default, node_params.cw_max_default, node_params.cw_stage_max,
+					distance_to_token, node_params.backoff_type, current_traffic_type);
+				LOGS(node_params.save_node_logs, node_logger.file,
+					"%.15f;N%d;S%d;%s;%s DATA %d tx done. ACK suppressed, assuming delivery success.\n",
+					SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2, notification.packet_id);
+				RestartNode(FALSE);
+			} else {
+				// Normal / Co-TDMA: wait for ACK directly
+				time_to_trigger = SimTime() + SIFS + TIME_OUT_EXTRA_TIME;
+				trigger_ACK_timeout.Set(FixTimeOffset(time_to_trigger,13,12));
+				node_state = STATE_WAIT_ACK;
+				LOGS(node_params.save_node_logs,node_logger.file,
+					"%.15f;N%d;S%d;%s;%s DATA %d tx finished. Waiting for ACK...\n",
+					SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2, notification.packet_id);
+			}
+
+			break;
+		}
+
+		case STATE_TX_ACK_TF:{		// ACK TF sent (wait for STA's ACK)
+
+			Notification notification = GenerateNotification(PACKET_TYPE_ACK_TF, NODE_ID_MAPC_BROADCAST,
+				ack_tf_notification.packet_id, 0,
+				ack_tf_notification.timestamp_generated, TX_DURATION_NONE);
+			notification.mapc_group_id = wlan.mapc_group_ids[mapc_active_group_idx];
+			outportSelfFinishTX(notification);
+
+			// Now wait for ACK from own STA
+			time_to_trigger = SimTime() + SIFS + TIME_OUT_EXTRA_TIME;
+			trigger_ACK_timeout.Set(FixTimeOffset(time_to_trigger, 13, 12));
+			node_state = STATE_WAIT_ACK;
+
+			LOGS(node_params.save_node_logs, node_logger.file,
+				"%.15f;N%d;S%d;%s;%s ACK TF #%d tx finished. Waiting for ACK from N%d.\n",
+				SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2,
+				notification.packet_id, current_destination_id);
+
+			break;
+		}
+
+		case STATE_TX_ACK:{		// Restart node
+
+			Notification notification = GenerateNotification(PACKET_TYPE_ACK, current_destination_id,
+				ack_notification.packet_id, ack_notification.tx_info.num_packets_aggregated,
+				ack_notification.timestamp_generated, TX_DURATION_NONE);
+
+			outportSelfFinishTX(notification);
+
+			LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s ACK %d tx finished. Restarting node...\n",
+				SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2, notification.packet_id);
+
+			RestartNode(FALSE);
+
+			break;
+		}
+
+		case STATE_TX_ICF:{		// Wait for ICR (MAPC response to ICF, analogous to CTS after RTS)
+
+			// Use NODE_ID_MAPC_BROADCAST so HandleFinishTX_StateRxIcf guard passes at coordinated APs
+			Notification notification = GenerateNotification(PACKET_TYPE_ICF, NODE_ID_MAPC_BROADCAST,
+				icf_notification.packet_id, limited_num_packets_aggregated,
+				icf_notification.timestamp_generated, TX_DURATION_NONE);
+			notification.mapc_group_id = wlan.mapc_group_ids[mapc_active_group_idx];
+			notification.mapc_target_ap_id = icf_notification.mapc_target_ap_id;
+
+			outportSelfFinishTX(notification);
+
+			// ICR timeout reuses trigger_CTS_timeout (same semantic role: waiting for control response)
+			time_to_trigger = SimTime() + SIFS + notification.tx_info.cts_duration;
+			trigger_CTS_timeout.Set(FixTimeOffset(time_to_trigger,13,12));
+
+			node_state = STATE_WAIT_ICR;
+
+			LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s ICF #%d tx finished. Waiting for ICR until %.12f\n",
+				SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2,
+				notification.packet_id, trigger_CTS_timeout.GetTime());
+
+			break;
+		}
+
+		case STATE_TX_ICR:{		// ICR sent (wait for MU-RTS/TXS or TF)
+			outportSelfFinishTX(icr_notification);
+			int icr_rejected = FALSE;
+			if (wlan.mapc_method_ids[mapc_active_group_idx] == CO_TDMA) {
+				if (icr_notification.mapc_has_data) {
+					// Has data: wait for MU-RTS/TXS after coordinator's DATA/ACK exchange
+					node_state = STATE_WAIT_MU_RTS;
+					time_to_trigger = SimTime() + SIFS + (tdma_pilot.enabled ? tdma_pilot.peer_s() : data_duration) + SIFS + ack_duration
+									+ SIFS + TIME_OUT_EXTRA_TIME;
+					trigger_NAV_timeout.Set(FixTimeOffset(time_to_trigger, 13, 12));
+				} else {
+					// ICR rejection (no data): coordinator will continue TXOP solo.
+					// Channel will be busy during coordinator's DATA slot, so our backoff freezes naturally.
+					icr_rejected = TRUE;
+					LOGS(node_params.save_node_logs, node_logger.file,
+						"%.15f;N%d;S%d;%s;%s ICR sent as rejection (no data). Coordinator continues solo; returning to SENSING.\n",
+						SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2);
+					coordinator_ap_id = NODE_ID_NONE;
+					RestartNode(TRUE);
+				}
+			} else {
+				// Co-BF / Co-SR
+				if (icr_notification.mapc_has_data) {
+					// Has data: wait for TF from coordinator
+					node_state = STATE_WAIT_TF;
+					time_to_trigger = SimTime() + SIFS + TIME_OUT_EXTRA_TIME;
+					trigger_DATA_timeout.Set(FixTimeOffset(time_to_trigger, 13, 12));
+				} else {
+					// ICR rejection (no data): coordinator will transmit solo; return to SENSING.
+					icr_rejected = TRUE;
+					LOGS(node_params.save_node_logs, node_logger.file,
+						"%.15f;N%d;S%d;%s;%s ICR sent as rejection (no data). Coordinator continues solo; returning to SENSING.\n",
+						SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2);
+					coordinator_ap_id = NODE_ID_NONE;
+					RestartNode(TRUE);
+				}
+			}
+			if (!icr_rejected) {
+				LOGS(node_params.save_node_logs, node_logger.file,
+					"%.15f;N%d;S%d;%s;%s ICR tx finished; waiting for %s\n",
+					SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2,
+					(wlan.mapc_method_ids[mapc_active_group_idx] == CO_TDMA) ? "MU-RTS/TXS" : "TF");
+			}
+			break;
+		}
+
+		case STATE_TX_TF:{		// TF sent -> coordinator starts DATA simultaneously (Co-BF/Co-SR)
+
+			// Use NODE_ID_MAPC_BROADCAST to match the TF start notification (broadcast frame)
+			Notification notification = GenerateNotification(PACKET_TYPE_TF, NODE_ID_MAPC_BROADCAST,
+				tf_notification.packet_id, tf_notification.tx_info.num_packets_aggregated,
+				tf_notification.timestamp_generated, TX_DURATION_NONE);
+			notification.mapc_group_id                          = wlan.mapc_group_ids[mapc_active_group_idx];
+			notification.tx_info.mapc_sr_peer_tx_power          = tf_notification.tx_info.mapc_sr_peer_tx_power;
+			notification.tx_info.mapc_allocated_data_duration   = tf_notification.tx_info.mapc_allocated_data_duration;
+
+			outportSelfFinishTX(notification);
+
+			LOGS(node_params.save_node_logs,node_logger.file,
+				"%.15f;N%d;S%d;%s;%s TF #%d tx finished. Coordinator starts DATA simultaneously.\n",
+				SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2, notification.packet_id);
+
+			// Coordinator also transmits DATA immediately after SIFS (simultaneous with coordinated AP)
+			exchange_sequence = IEEE_802_11_NO_RTS_CTS;
+			SelectDestination();
+			// Apply STA BW cap for the coordinator's DATA phase (ICF used full BW; DATA is unicast).
+			{
+				int eff_min = node_params.min_channel_allowed;
+				int eff_max = node_params.max_channel_allowed;
+				if (current_destination_id >= 0) {
+					int sta_min_ch, sta_max_ch;
+					wlan.GetStaChannelBounds(current_destination_id, &sta_min_ch, &sta_max_ch);
+					if (sta_min_ch >= 0 && sta_min_ch > eff_min) eff_min = sta_min_ch;
+					if (sta_max_ch >= 0 && sta_max_ch < eff_max) eff_max = sta_max_ch;
+				}
+				GetChannelOccupancyByCCA(node_params.current_primary_channel, node_params.pifs_activated,
+					channels_free, eff_min, eff_max,
+					&channel_power, current_pd, timestamp_channel_becomes_free, SimTime(), PIFS);
+				GetTxChannels(channels_for_tx, node_params.current_dcb_policy, channels_free,
+					eff_min, eff_max, node_params.current_primary_channel,
+					NUM_CHANNELS_KOMONDOR, &channel_power, channel_aggregation_cca_model, NULL);
+			}
+			// No packets were ACKed during the ICF/ICR/TF exchange; reset so
+			// PrepareNewTransmission does not attempt to delete from the empty buffer
+			limited_num_packets_aggregated = 0;
+			PrepareNewTransmission();
+
+			break;
+		}
+
+		case STATE_TX_NPCA_ICF:{
+			Notification _npca_icf_fin = GenerateNotification(PACKET_TYPE_NPCA_ICF, current_destination_id,
+				icf_notification.packet_id, limited_num_packets_aggregated, SimTime(), TX_DURATION_NONE);
+			outportSelfFinishTX(_npca_icf_fin);
+			time_to_trigger = SimTime() + SIFS
+				+ (double)NPCA_SWITCH_TIME_US * MICRO_VALUE
+				+ (double)NPCA_ICR_DURATION_US * MICRO_VALUE;
+			trigger_npca_icr_timeout.Set(FixTimeOffset(time_to_trigger, 13, 12));
+			node_state = STATE_RX_NPCA_ICR;
+			break;
+		}
+
+		case STATE_TX_DATA_NPCA:{
+			Notification _npca_data_fin = GenerateNotification(PACKET_TYPE_DATA, current_destination_id,
+				data_notification.packet_id, data_notification.tx_info.num_packets_aggregated,
+				data_notification.timestamp_generated, TX_DURATION_NONE);
+			_npca_data_fin.tx_info.ack_required = data_notification.tx_info.ack_required;
+			outportSelfFinishTX(_npca_data_fin);
+			time_to_trigger = SimTime() + SIFS + TIME_OUT_EXTRA_TIME;
+			trigger_ACK_timeout.Set(FixTimeOffset(time_to_trigger, 13, 12));
+			node_state = STATE_WAIT_ACK_NPCA;
+			break;
+		}
+
+		case STATE_TX_DSO_ICF:{
+			Notification _dso_icf_fin = GenerateNotification(PACKET_TYPE_DSO_ICF, current_destination_id,
+				icf_notification.packet_id, limited_num_packets_aggregated, SimTime(), TX_DURATION_NONE);
+			_dso_icf_fin.tx_info.dso_tx           = 1;
+			_dso_icf_fin.tx_info.dso_subband_left  = dso_channels_for_tx[0];
+			_dso_icf_fin.tx_info.dso_subband_right = dso_channels_for_tx[1];
+			outportSelfFinishTX(_dso_icf_fin);
+			time_to_trigger = SimTime() + SIFS
+				+ (double)DSO_SWITCH_TIME_US * MICRO_VALUE
+				+ (double)DSO_ICR_DURATION_US * MICRO_VALUE;
+			trigger_dso_icr_timeout.Set(FixTimeOffset(time_to_trigger, 13, 12));
+			node_state = STATE_RX_DSO_ICR;
+			break;
+		}
+
+		case STATE_TX_DATA_DSO:{
+			Notification _dso_data_fin = GenerateNotification(PACKET_TYPE_DATA, current_destination_id,
+				data_notification.packet_id, data_notification.tx_info.num_packets_aggregated,
+				data_notification.timestamp_generated, TX_DURATION_NONE);
+			_dso_data_fin.tx_info.dso_tx = 1;
+			_dso_data_fin.tx_info.ack_required = data_notification.tx_info.ack_required;
+			outportSelfFinishTX(_dso_data_fin);
+			time_to_trigger = SimTime() + SIFS + TIME_OUT_EXTRA_TIME;
+			trigger_ACK_timeout.Set(FixTimeOffset(time_to_trigger, 13, 12));
+			node_state = STATE_WAIT_ACK_DSO;
+			break;
+		}
+
+		default:
+			break;
+	}
+
+    // Reset the flag that indicates whether the tx power changed or not
+    sr_state.flag_change_in_tx_power = FALSE;
+
+	ObserveAp("tx_complete");
+	// LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s  MyTxFinished()\n", SimTime(), node_params.node_id, node_state, LOG_G01, LOG_LVL1);
+};
+
+/**
+ * DsoIcrTimeout: fires after DSO ICF + STA switch time + ICR duration.
+ * AP switches channel range to the DSO secondary subband and sends DATA.
+ */
+void Node :: DsoIcrTimeout(trigger_t &){
+
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s DsoIcrTimeout: switching to DSO subband [%d,%d]\n",
+		SimTime(), node_params.node_id, node_state, LOG_F00, LOG_LVL1,
+		dso_channels_for_tx[0], dso_channels_for_tx[1]);
+
+	// Switch channel range to DSO secondary subband (dso_channels_for_tx[0..1] = {left,right})
+	{
+		int _dl = dso_channels_for_tx[0];
+		int _dr = dso_channels_for_tx[1];
+		for (int _c = 0; _c < NUM_CHANNELS_KOMONDOR; ++_c)
+			channels_for_tx[_c] = (_c >= _dl && _c <= _dr) ? TRUE : FALSE;
+		current_left_channel  = _dl;
+		current_right_channel = _dr;
+	}
+
+	node_state = STATE_TX_DATA_DSO;
+	PrepareNewTransmission();
+}
+
+/**
+ * CheckAndArmNpcaSwitch: freeze primary backoff and arm switch to NPCA channel.
+ */
+void Node :: CheckAndArmNpcaSwitch() {
+	if (trigger_npca_switch.Active()) return;
+	if (trigger_end_backoff.Active())
+		npca_stored_backoff_counter = (int)(ComputeRemainingBackoff(
+			node_params.backoff_type, trigger_end_backoff.GetTime() - SimTime()) / SLOT_TIME + 0.5);
+	else
+		npca_stored_backoff_counter = (ca_state.remaining_backoff > 0)
+			? (int)(ca_state.remaining_backoff / SLOT_TIME + 0.5) : 0;
+	npca_stored_cw = ca_state.current_cw_max;
+	npca_stored_primary_channel = node_params.current_primary_channel;
+	trigger_end_backoff.Cancel();
+	trigger_start_backoff.Cancel();
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s NPCA: arming switch to ch%d (stored BO=%d)\n",
+		SimTime(), node_params.node_id, node_state, LOG_F00, LOG_LVL1,
+		npca_primary_channel, npca_stored_backoff_counter);
+	time_to_trigger = SimTime() + (double)npca_switching_delay_us * MICRO_VALUE;
+	trigger_npca_switch.Set(FixTimeOffset(time_to_trigger, 13, 12));
+}
+
+/**
+ * NpcaSwitchComplete: radio tuned to NPCA channel. Start NPCA_TIMER and draw backoff.
+ */
+void Node :: NpcaSwitchComplete(trigger_t &) {
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s NPCA: on ch%d; starting NPCA_TIMER\n",
+		SimTime(), node_params.node_id, node_state, LOG_F00, LOG_LVL1, npca_primary_channel);
+	npca_on_npca_channel = 1;
+	int _nl = -1, _nr = -1;
+	if (!GetTxChannelsNPCA(&_nl, &_nr, npca_primary_channel,
+			node_params.current_primary_channel,
+			node_params.min_channel_allowed, node_params.max_channel_allowed,
+			&channel_power, current_pd)) {
+		npca_on_npca_channel = 0;
+		ca_state.remaining_backoff = (double)npca_stored_backoff_counter * SLOT_TIME;
+		ca_state.current_cw_max    = npca_stored_cw;
+		time_to_trigger = SimTime() + DIFS;
+		trigger_start_backoff.Set(FixTimeOffset(time_to_trigger, 13, 12));
+		return;
+	}
+	for (int _c = 0; _c < NUM_CHANNELS_KOMONDOR; ++_c)
+		npca_channels_for_tx[_c] = (_c >= _nl && _c <= _nr) ? TRUE : FALSE;
+	// Update effective primary channel so IsPacketLost passes for NPCA frames
+	node_params.current_primary_channel = npca_primary_channel;
+	time_to_trigger = SimTime() + npca_timer_duration;
+	trigger_npca_timer.Set(FixTimeOffset(time_to_trigger, 13, 12));
+	{
+		int _cw_base = (1 << npca_init_qsrc) * (GetAcCwMin(current_traffic_type) + 1) - 1;
+		npca_cw = _cw_base;
+		int _bo = (int)(((double)rand() / (double)RAND_MAX) * (double)_cw_base);
+		time_to_trigger = SimTime() + (double)_bo * SLOT_TIME;
+		if (time_to_trigger <= SimTime()) time_to_trigger = SimTime() + SLOT_TIME;
+		trigger_npca_backoff.Set(FixTimeOffset(time_to_trigger, 13, 12));
+	}
+}
+
+/**
+ * EndNpcaBackoff: NPCA EDCA backoff expired. Check channels and start ICF.
+ */
+void Node :: EndNpcaBackoff(trigger_t &) {
+	if (!npca_on_npca_channel) return;
+	if (node_params.node_type != NODE_TYPE_AP) return;
+	int _nl = -1, _nr = -1;
+	if (!GetTxChannelsNPCA(&_nl, &_nr, npca_primary_channel,
+			npca_stored_primary_channel,
+			node_params.min_channel_allowed, node_params.max_channel_allowed,
+			&channel_power, current_pd)) {
+		int _bo = (int)(((double)rand() / (double)RAND_MAX) * (double)npca_cw);
+		if (_bo < 1) _bo = 1;
+		time_to_trigger = SimTime() + (double)_bo * SLOT_TIME;
+		trigger_npca_backoff.Set(FixTimeOffset(time_to_trigger, 13, 12));
+		return;
+	}
+	for (int _c = 0; _c < NUM_CHANNELS_KOMONDOR; ++_c)
+		npca_channels_for_tx[_c] = (_c >= _nl && _c <= _nr) ? TRUE : FALSE;
+	current_left_channel  = _nl;
+	current_right_channel = _nr;
+	for (int _c = 0; _c < NUM_CHANNELS_KOMONDOR; ++_c)
+		channels_for_tx[_c] = npca_channels_for_tx[_c];
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s NPCA: backoff done; ICF on [%d,%d]\n",
+		SimTime(), node_params.node_id, node_state, LOG_F00, LOG_LVL1, _nl, _nr);
+	node_state = STATE_TX_NPCA_ICF;
+	exchange_sequence = IEEE_802_11_NPCA;
+	if (wlan.num_stas > 0)
+		current_destination_id = wlan.list_sta_id[dso_rr_idx % wlan.num_stas];
+	ComputeFramesDuration(&rts_duration, &cts_duration, &data_duration, &ack_duration,
+		current_right_channel - current_left_channel + 1, current_modulation,
+		limited_num_packets_aggregated, node_params.frame_length, bits_ofdm_sym);
+	PrepareNewTransmission();
+}
+
+/**
+ * NpcaIcrTimeout: ICR wait done. Send DATA on NPCA channels.
+ */
+void Node :: NpcaIcrTimeout(trigger_t &) {
+	if (!npca_on_npca_channel) return;
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s NPCA: ICR timeout; DATA on [%d,%d]\n",
+		SimTime(), node_params.node_id, node_state, LOG_F00, LOG_LVL1,
+		current_left_channel, current_right_channel);
+	node_state = STATE_TX_DATA_NPCA;
+	PrepareNewTransmission();
+}
+
+/**
+ * NpcaSwitchBack: NPCA_TIMER expired. Restore BSS primary backoff.
+ */
+void Node :: NpcaSwitchBack(trigger_t &) {
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s NPCA: TIMER expired; returning to BSS primary\n",
+		SimTime(), node_params.node_id, node_state, LOG_F00, LOG_LVL1);
+	trigger_npca_switch.Cancel();
+	trigger_npca_icr_timeout.Cancel();
+	trigger_npca_backoff.Cancel();
+	npca_on_npca_channel = 0;
+	node_params.current_primary_channel = npca_stored_primary_channel;
+	current_left_channel  = node_params.min_channel_allowed;
+	current_right_channel = node_params.max_channel_allowed;
+	for (int _c = 0; _c < NUM_CHANNELS_KOMONDOR; ++_c)
+		channels_for_tx[_c] = FALSE;
+	channels_for_tx[node_params.current_primary_channel] = TRUE;
+	ca_state.remaining_backoff = (double)npca_stored_backoff_counter * SLOT_TIME;
+	ca_state.current_cw_max    = npca_stored_cw;
+	node_state = STATE_SENSING;
+	time_to_trigger = SimTime() + (double)npca_switch_back_delay_us * MICRO_VALUE + DIFS;
+	trigger_start_backoff.Set(FixTimeOffset(time_to_trigger, 13, 12));
+}
+
+/**
+ * HandleFinishTX_StateRxIcf: coordinated AP responds with ICR after receiving ICF
+ */
+void Node :: HandleFinishTX_StateRxIcf(const Notification &notification) {
+	if (notification.packet_type != PACKET_TYPE_ICF
+			|| notification.destination_id != NODE_ID_MAPC_BROADCAST
+			|| notification.mapc_group_id != wlan.mapc_group_ids[mapc_active_group_idx]) return;
+	// Only coordinated APs (not STAs) respond; only the targeted AP responds with ICR
+	if (node_params.node_type != NODE_TYPE_AP) return;
+	if (notification.mapc_target_ap_id != node_params.node_id) return;
+	AcceptTdmaIcf(notification);
+	if (paper_replay.enabled) paper_replay.shared_ll_only=paper_replay.sharing_policy==2;
+
+	// CCA check: same pattern as RTS -> CTS
+	GetChannelOccupancyByCCA(node_params.current_primary_channel, node_params.pifs_activated,
+		channels_free, current_left_channel, current_right_channel,
+		&channel_power, current_pd, timestamp_channel_becomes_free, SimTime(), PIFS);
+
+	GetTxChannels(channels_for_tx, node_params.current_dcb_policy, channels_free,
+		current_left_channel, current_right_channel, node_params.current_primary_channel,
+		NUM_CHANNELS_KOMONDOR, &channel_power, channel_aggregation_cca_model, NULL);
+
+	if (channels_for_tx[0] == TX_NOT_POSSIBLE) {
+		RestartNode(TRUE);
+		return;
+	}
+
+	current_left_channel  = GetFirstOrLastTrueElemOfArray(FIRST_TRUE_IN_ARRAY,
+		channels_for_tx, NUM_CHANNELS_KOMONDOR);
+	current_right_channel = GetFirstOrLastTrueElemOfArray(LAST_TRUE_IN_ARRAY,
+		channels_for_tx, NUM_CHANNELS_KOMONDOR);
+
+	current_destination_id = coordinator_ap_id;
+	node_state             = STATE_TX_ICR;
+	++node_stats.num_icr_tx;
+	current_tx_duration    = cts_duration;
+
+	icr_notification = GenerateNotification(PACKET_TYPE_ICR, coordinator_ap_id,
+		notification.packet_id, notification.tx_info.num_packets_aggregated,
+		notification.timestamp_generated, current_tx_duration);
+	icr_notification.mapc_group_id = wlan.mapc_group_ids[mapc_active_group_idx];
+	icr_notification.tx_duration = current_tx_duration;
+	// Report data availability to coordinator so it can skip the MU-RTS slot if needed
+	icr_notification.mapc_has_data = (node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION
+		|| buffer.QueueSize() > 0) ? TRUE : FALSE;
+	if (paper_replay.enabled && paper_replay.sharing_policy==2) {
+		icr_notification.mapc_has_data=buffer.AcSize(0)>0;
+		icr_notification.tx_info.mapc_allocated_data_duration=0;
+		if (buffer.AcSize(0)>0) {
+			unsigned int first=0;
+			while(buffer.m_queue[first].paper_ac!=0) ++first;
+			Notification p=buffer.m_queue[first];
+			int count=0;
+			for(unsigned int i=0;i<buffer.m_queue.size();++i)
+				if(buffer.m_queue[i].paper_ac==0 && buffer.m_queue[i].destination_id==p.destination_id
+					&& buffer.m_queue[i].frame_length==p.frame_length) ++count;
+			double bits=GetNumberSubcarriers(current_right_channel-current_left_channel+1)
+				*Mcs_array::modulation_bits[7]*Mcs_array::coding_rates[7]*IEEE_AX_SU_SPATIAL_STREAMS;
+			int aggregate=FindMaximumPacketsAggregated(std::min(count,64),p.frame_length,bits);
+			double r,c,a,d;
+			ComputeFramesDuration(&r,&c,&d,&a,current_right_channel-current_left_channel+1,
+				8,aggregate,p.frame_length,bits);
+			icr_notification.tx_info.mapc_allocated_data_duration=d;
+		}
+	}
+
+	// Co-SR/BF: embed this AP's desired DATA duration so coordinator can negotiate aligned TXOP.
+	// Use mcs_per_node[0] (first STA); report 0 if MCS is not yet established.
+	if (wlan.mapc_method_ids[mapc_active_group_idx] != CO_TDMA) {
+		int _ix_ch = (int)log2((double)(current_right_channel - current_left_channel + 1));
+		int _mod   = mcs_per_node[0][_ix_ch];
+		if (_mod > 0) {
+			double _bs = (double)GetNumberSubcarriers(current_right_channel - current_left_channel + 1)
+				* Mcs_array::modulation_bits[_mod - 1]
+				* Mcs_array::coding_rates[_mod - 1]
+				* (double)IEEE_AX_SU_SPATIAL_STREAMS;
+			int _lnpa = (node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION)
+				? node_params.max_num_packets_aggregated
+				: ((buffer.QueueSize() < node_params.max_num_packets_aggregated)
+				   ? buffer.QueueSize() : node_params.max_num_packets_aggregated);
+			_lnpa = FindMaximumPacketsAggregated(_lnpa, node_params.frame_length, _bs);
+			if (_lnpa > 0) {
+				double _req_data = 0.0, _dmy1 = 0.0, _dmy2 = 0.0, _dmy3 = 0.0;
+				ComputeFramesDuration(&_dmy1, &_dmy2, &_req_data, &_dmy3,
+					current_right_channel - current_left_channel + 1,
+					_mod, _lnpa, node_params.frame_length, (int)_bs);
+				icr_notification.tx_info.mapc_allocated_data_duration = _req_data;
+			} else {
+				icr_notification.tx_info.mapc_allocated_data_duration = 0.0;
+			}
+		} else {
+			icr_notification.tx_info.mapc_allocated_data_duration = 0.0;
+		}
+	}
+
+	sr_state.flag_change_in_tx_power = FALSE;
+
+	// Stagger: position 0 → SIFS; position k → SIFS + k*(cts_duration + SIFS)
+	double sifs_delay = SIFS + mapc_peer_position * (cts_duration + SIFS);
+	time_to_trigger = SimTime() + sifs_delay;
+	trigger_SIFS.Set(FixTimeOffset(time_to_trigger, 13, 12));
+
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s ICF done, sending ICR after %.9f s (stagger pos %d)\n",
+		SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3,
+		sifs_delay, mapc_peer_position);
+}
+
+/**
+ * HandleFinishTX_StateRxIcr: coordinator collects ICRs and proceeds when all received
+ */
+void Node :: HandleFinishTX_StateRxIcr(const Notification &notification) {
+	if (notification.packet_type != PACKET_TYPE_ICR
+			|| notification.destination_id != node_params.node_id
+            || notification.source_id != mapc_selected_peer_id
+            || notification.mapc_group_id != wlan.mapc_group_ids[mapc_active_group_idx]) return;
+
+	++mapc_icr_received_count;
+	++node_stats.num_icr_rx;
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s ICR received from N%d (%d/%d) has_data=%d\n",
+		SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3,
+		notification.source_id, mapc_icr_received_count, num_coordinated_aps,
+		notification.mapc_has_data);
+
+	// Co-TDMA targets exactly one peer per TXOP — proceed immediately after the first ICR
+	trigger_CTS_timeout.Cancel();
+	mapc_icr_received_count = 0;
+	mapc_peer_has_data = notification.mapc_has_data;
+	ObserveAp("icr_received", &notification);
+	// Save coordinated AP's requested duration for TXOP negotiation in ProceedAfterIcr
+	mapc_icr_requested_duration = notification.tx_info.mapc_allocated_data_duration;
+	ProceedAfterIcr();
+}
+
+/**
+ * CoSRRate: link rate for the two-link Co-SR interference channel, treating interference as noise
+ */
+static double CoSRRate(double h_own, double p_own, double h_cross, double p_cross) {
+	double n0_pW = ConvertPower(DBM_TO_PW, NOISE_LEVEL_DBM);
+	double sinr = (h_own * p_own) / (n0_pW + h_cross * p_cross);
+	return log(1.0 + sinr);
+}
+
+/**
+ * CoSRPFObjective: ln(R_A) + ln(R_B)
+ */
+static double CoSRPFObjective(double h_AA, double h_AB, double h_BA, double h_BB,
+		double p_a, double p_b) {
+	double r_a = CoSRRate(h_AA, p_a, h_BA, p_b);
+	double r_b = CoSRRate(h_BB, p_b, h_AB, p_a);
+	if (r_a <= 0.0 || r_b <= 0.0) return -1e18;
+	return log(r_a) + log(r_b);
+}
+
+/**
+ * CoSREdgeFeasibleRange: on the edge where the AP indicated by fixed_is_a is held at
+ * p_max_pW, both APs must still clear the shared capture-effect SINR target gamma (linear) for their own link to be decodable. 
+ * This bounds the free AP's power to [floor, ceil]:
+ *   floor: the free AP's own SINR >= gamma
+ *   ceil : the fixed AP's SINR (which the free AP interferes with) >= gamma
+ * Returns 0 (infeasible, empty interval) or 1 (feasible) and writes [*lo,*hi].
+ */
+static int CoSREdgeFeasibleRange(double h_AA, double h_AB, double h_BA, double h_BB,
+		double p_max_pW, double gamma, int fixed_is_a, double *lo, double *hi) {
+	double n0_pW = ConvertPower(DBM_TO_PW, NOISE_LEVEL_DBM);
+	double gamma_margin = gamma * ConvertPower(DB_TO_LINEAR, COSR_FEASIBILITY_MARGIN_DB);
+	double floor_v, ceil_v;
+	if (fixed_is_a) {
+		/* free = P_B */
+		floor_v = gamma_margin * (n0_pW + h_AB * p_max_pW) / h_BB;
+		ceil_v  = (h_AA * p_max_pW / gamma_margin - n0_pW) / h_BA;
+	} else {
+		/* free = P_A */
+		floor_v = gamma_margin * (n0_pW + h_BA * p_max_pW) / h_AA;
+		ceil_v  = (h_BB * p_max_pW / gamma_margin - n0_pW) / h_AB;
+	}
+	*lo = (floor_v > 1e-9) ? floor_v : 1e-9;
+	*hi = (ceil_v < p_max_pW) ? ceil_v : p_max_pW;
+	return (*hi >= *lo) ? 1 : 0;
+}
+
+/**
+ * CoSRTernarySearch: maximize the PF objective along one edge of the box, with the AP
+ * indicated by fixed_is_a held at p_max_pW and the other varied in [lo,hi] (the
+ * capture-effect-feasible sub-range from CoSREdgeFeasibleRange, a subset of
+ * (0,Pmax]). Each edge is unimodal (one rate strictly decreasing, the other strictly
+ * increasing in the free variable), so ternary search converges to the edge optimum
+ * in a handful of iterations.
+ */
+static double CoSRTernarySearch(double h_AA, double h_AB, double h_BA, double h_BB,
+		double p_max_pW, double lo, double hi, int fixed_is_a, double *out_obj) {
+	for (int it = 0; it < 40; ++it) {
+		double m1 = lo + (hi - lo) / 3.0;
+		double m2 = hi - (hi - lo) / 3.0;
+		double obj1 = fixed_is_a ? CoSRPFObjective(h_AA, h_AB, h_BA, h_BB, p_max_pW, m1)
+		                         : CoSRPFObjective(h_AA, h_AB, h_BA, h_BB, m1, p_max_pW);
+		double obj2 = fixed_is_a ? CoSRPFObjective(h_AA, h_AB, h_BA, h_BB, p_max_pW, m2)
+		                         : CoSRPFObjective(h_AA, h_AB, h_BA, h_BB, m2, p_max_pW);
+		if (obj1 < obj2) lo = m1; else hi = m2;
+	}
+	double x = (lo + hi) / 2.0;
+	*out_obj = fixed_is_a ? CoSRPFObjective(h_AA, h_AB, h_BA, h_BB, p_max_pW, x)
+	                      : CoSRPFObjective(h_AA, h_AB, h_BA, h_BB, x, p_max_pW);
+	return x;
+}
+
+/**
+ * CoSRDiscreteRateProxy: real MCS/rate lookup, mirroring SelectMCSResponse and Mcs_array
+ */
+static double CoSRDiscreteRateProxy(double pw_received_pW, int num_channels_ix) {
+	static const int N_THRESHOLDS = 13;
+	static const double MCS_THRESHOLDS[N_THRESHOLDS] = {
+		-79, -77, -74, -70, -66, -65, -64, -59, -57, -54, -52, -48, -46
+	};
+	static const int MCS_VALUES[N_THRESHOLDS + 1] = {
+		MODULATION_BPSK_1_2, MODULATION_QPSK_1_2, MODULATION_QPSK_3_4,
+		MODULATION_16QAM_1_2, MODULATION_16QAM_3_4, MODULATION_64QAM_2_3,
+		MODULATION_64QAM_3_4, MODULATION_64QAM_5_6, MODULATION_256QAM_3_4,
+		MODULATION_256QAM_5_6, MODULATION_1024QAM_3_4, MODULATION_1024QAM_5_6,
+		MODULATION_4096QAM_3_4, MODULATION_4096QAM_5_6
+	};
+	double pw_rx_dbm = ConvertPower(PW_TO_DBM, pw_received_pW);
+	double offset = num_channels_ix * 3.0;
+	int ix;
+	for (ix = 0; ix < N_THRESHOLDS; ++ix) {
+		if (pw_rx_dbm < MCS_THRESHOLDS[ix] + offset) break;
+	}
+	int mcs = MCS_VALUES[ix];
+	return Mcs_array::modulation_bits[mcs - 1] * Mcs_array::coding_rates[mcs - 1];
+}
+
+/**
+ * ComputeCoSRTxPowers: compute TX power limits for the Co-SR simultaneous DATA phase.
+ *
+ * @return 1 if a feasible simultaneous allocation was found (coordinator_pW, peer_pW
+ *         are valid), 0 if infeasible (caller should fall back to time-sharing).
+ *         COSR_POLICY_STATIC always returns 1 (legacy: no feasibility check, matches
+ *         pre-existing behavior exactly).
+ */
+int Node :: ComputeCoSRTxPowers(double &coordinator_pW, double &peer_pW) {
+	int group_idx = mapc_active_group_idx;
+	int policy = wlan.mapc_cosr_policy[group_idx];
+
+	if (policy == COSR_POLICY_STATIC) {
+		double limit_pW = ConvertPower(DBM_TO_PW, wlan.mapc_sr_tx_power_dbm[group_idx]);
+		peer_pW = limit_pW;
+#if COSR_POWER_LIMIT_PEER_ONLY == 0
+		coordinator_pW = limit_pW;
+#endif
+		return 1;
+	}
+
+	/* Selfish/Continuous/Discrete all need the topology-derived channel gains. */
+	double p_max_pW = ConvertPower(DBM_TO_PW, wlan.mapc_sr_tx_power_dbm[group_idx]);
+	double gamma    = node_params.capture_effect;
+
+	int own_sta_id  = wlan.list_sta_id[0];
+	int peer_ap_id  = wlan.mapc_peer_ap_ids[group_idx][0];
+	int peer_sta_id = all_node_first_sta_id[peer_ap_id];
+
+	double d_AA = distances_array[own_sta_id];
+	double d_AB = distances_array[peer_sta_id];
+	double d_BA = ComputeDistance(all_node_x[peer_ap_id], all_node_y[peer_ap_id], all_node_z[peer_ap_id],
+		all_node_x[own_sta_id], all_node_y[own_sta_id], all_node_z[own_sta_id]);
+	double d_BB = ComputeDistance(all_node_x[peer_ap_id], all_node_y[peer_ap_id], all_node_z[peer_ap_id],
+		all_node_x[peer_sta_id], all_node_y[peer_sta_id], all_node_z[peer_sta_id]);
+
+	const double REF_PW = 1.0;	// 1 pW reference tx power to sample the (tx-power-independent) channel gain
+	double h_AA = ComputePowerReceived(d_AA, REF_PW, node_params.central_frequency, node_params.path_loss_model);
+	double h_AB = ComputePowerReceived(d_AB, REF_PW, node_params.central_frequency, node_params.path_loss_model);
+	double h_BA = ComputePowerReceived(d_BA, REF_PW, node_params.central_frequency, node_params.path_loss_model);
+	double h_BB = ComputePowerReceived(d_BB, REF_PW, node_params.central_frequency, node_params.path_loss_model);
+
+	double lo1, hi1;
+	int edge1_feasible = CoSREdgeFeasibleRange(h_AA, h_AB, h_BA, h_BB, p_max_pW, gamma, 1, &lo1, &hi1);
+
+	if (policy == COSR_POLICY_SELFISH) {
+		/* Only the coordinator-fixed edge is ever considered -- no comparison against
+		 * the mirrored (peer-fixed) assignment. See Method 1 / Eq. donor. */
+		if (!edge1_feasible) return 0;
+		coordinator_pW = p_max_pW;
+		peer_pW        = hi1;
+		return 1;
+	}
+
+	double lo2, hi2;
+	int edge2_feasible = CoSREdgeFeasibleRange(h_AA, h_AB, h_BA, h_BB, p_max_pW, gamma, 0, &lo2, &hi2);
+
+	if (!edge1_feasible && !edge2_feasible) return 0;
+
+	double obj_a_fixed = -1e18, obj_b_fixed = -1e18;
+	double p_b_when_a_fixed = 0.0, p_a_when_b_fixed = 0.0;
+	if (policy == COSR_POLICY_DISCRETE) {
+		/* Discrete-rate-aware: within a feasible edge, an AP's achieved MCS/rate depends
+		 * only on its OWN received power (SelectMCSResponse), not on the peer's
+		 * interference -- decodability is already guaranteed by [lo,hi]. So the free
+		 * AP's power should simply be pushed to the top of its feasible range (hi is
+		 * already min(ceiling, p_max_pW) by construction); there is no interior
+		 * trade-off left to search for within an edge, only the edge choice itself. */
+		int channels_ix = (int) log2(node_params.max_channel_allowed - node_params.min_channel_allowed + 1);
+		if (edge1_feasible) {
+			p_b_when_a_fixed = hi1;
+			double rate_a = CoSRDiscreteRateProxy(h_AA * p_max_pW, channels_ix);
+			double rate_b = CoSRDiscreteRateProxy(h_BB * p_b_when_a_fixed, channels_ix);
+			obj_a_fixed = log(rate_a) + log(rate_b);
+		}
+		if (edge2_feasible) {
+			p_a_when_b_fixed = hi2;
+			double rate_a = CoSRDiscreteRateProxy(h_AA * p_a_when_b_fixed, channels_ix);
+			double rate_b = CoSRDiscreteRateProxy(h_BB * p_max_pW, channels_ix);
+			obj_b_fixed = log(rate_a) + log(rate_b);
+		}
+	} else { /* COSR_POLICY_CONTINUOUS */
+		if (edge1_feasible)
+			p_b_when_a_fixed = CoSRTernarySearch(h_AA, h_AB, h_BA, h_BB, p_max_pW, lo1, hi1, 1, &obj_a_fixed);
+		if (edge2_feasible)
+			p_a_when_b_fixed = CoSRTernarySearch(h_AA, h_AB, h_BA, h_BB, p_max_pW, lo2, hi2, 0, &obj_b_fixed);
+	}
+
+	if (obj_a_fixed >= obj_b_fixed) {
+		coordinator_pW = p_max_pW;
+		peer_pW        = p_b_when_a_fixed;
+	} else {
+		coordinator_pW = p_a_when_b_fixed;
+		peer_pW        = p_max_pW;
+	}
+	return 1;
+}
+
+/**
+ * ProceedAfterIcr: coordinator decides next action after all ICRs collected
+ */
+void Node :: ProceedAfterIcr() {
+	// Co-SR: compute simultaneous-phase powers up front so infeasibility (neither
+	// edge clears the shared capture-effect target within Pmax) can redirect this
+	// TXOP to the time-sharing (Co-TDMA) path below instead of forcing a simultaneous
+	// transmission guaranteed to drop a packet.
+	int mapc_time_sharing_fallback = FALSE;
+	mapc_time_sharing_active = false;
+	double cosr_coord_pW = current_tx_power;
+	double cosr_peer_pW  = current_tx_power;
+	if (wlan.mapc_method_ids[mapc_active_group_idx] == CO_SR && mapc_peer_has_data) {
+		if (!ComputeCoSRTxPowers(cosr_coord_pW, cosr_peer_pW)) {
+			mapc_time_sharing_fallback = TRUE;
+			mapc_time_sharing_active = true;
+			LOGS(node_params.save_node_logs, node_logger.file,
+				"%.15f;N%d;S%d;%s;%s Co-SR infeasible (capture-effect targets unreachable "
+				"within Pmax); falling back to time-sharing this TXOP\n",
+				SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL2);
+		}
+	}
+
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s All ICRs collected. Proceeding with %s\n",
+		SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL2,
+		(wlan.mapc_method_ids[mapc_active_group_idx] == CO_TDMA || mapc_time_sharing_fallback)
+			? "Co-TDMA DATA" : "Co-BF/SR TF");
+	printf("AUDIT_DECISION;time=%.15f;node=%d;method=%d;peer_has_data=%d;fallback=%d;coord_pw=%.12g;peer_pw=%.12g\n",
+		SimTime(), node_params.node_id, wlan.mapc_method_ids[mapc_active_group_idx],
+		mapc_peer_has_data, mapc_time_sharing_fallback, cosr_coord_pW, cosr_peer_pW);
+
+	if (wlan.mapc_method_ids[mapc_active_group_idx] == CO_TDMA || mapc_time_sharing_fallback) {
+		// Coordinator sends its own DATA first (2-way: DATA/ACK)
+		exchange_sequence = IEEE_802_11_NO_RTS_CTS;
+		SelectDestination();
+		// Apply STA BW cap for coordinator DATA (ICF used full BSS BW; DATA is unicast).
+		{
+			int eff_min = node_params.min_channel_allowed;
+			int eff_max = node_params.max_channel_allowed;
+			if (current_destination_id >= 0) {
+				int sta_min_ch, sta_max_ch;
+				wlan.GetStaChannelBounds(current_destination_id, &sta_min_ch, &sta_max_ch);
+				if (sta_min_ch >= 0 && sta_min_ch > eff_min) eff_min = sta_min_ch;
+				if (sta_max_ch >= 0 && sta_max_ch < eff_max) eff_max = sta_max_ch;
+			}
+			GetChannelOccupancyByCCA(node_params.current_primary_channel, node_params.pifs_activated,
+				channels_free, eff_min, eff_max,
+				&channel_power, current_pd, timestamp_channel_becomes_free, SimTime(), PIFS);
+			GetTxChannels(channels_for_tx, node_params.current_dcb_policy, channels_free,
+				eff_min, eff_max, node_params.current_primary_channel,
+				NUM_CHANNELS_KOMONDOR, &channel_power, channel_aggregation_cca_model, NULL);
+		}
+		// No packets were ACKed during the ICF/ICR exchange; reset so
+		// PrepareNewTransmission does not attempt to delete from the empty buffer
+		limited_num_packets_aggregated = 0;
+		// Compute per-AP data duration based on TXOP split method
+		if (wlan.mapc_txop_splits[mapc_active_group_idx] == TXOP_SPLIT_EQUAL) {
+			int n_active = 1 + (mapc_peer_has_data ? 1 : 0);
+			mapc_txop_per_ap_data_duration = mapc_txop_data_budget / n_active;
+			// Cap to respect total Co-TDMA TXOP <= IEEE_AX_MAX_PPDU_DURATION.
+			// Overhead for n_active>1 (ICF+SIFS+ICR+ACK_A+SIFS+SIFS+MU-RTS+ACK_B+SIFS+SIFS):
+			//   = 2*rts_duration + cts_duration + 2*ack_duration + 4*SIFS
+			// For n_active==1 (no MU-RTS slot): rts + cts + ack + 2*SIFS
+			if (n_active > 1) {
+				double exchange_overhead = 2.0 * rts_duration + cts_duration
+					+ 2.0 * ack_duration + 4.0 * SIFS;
+				double per_ap_txop_limit =
+					(IEEE_AX_MAX_PPDU_DURATION - exchange_overhead) / (double) n_active;
+				if (per_ap_txop_limit < 0.0) per_ap_txop_limit = 0.0;
+				if (mapc_txop_per_ap_data_duration > per_ap_txop_limit)
+					mapc_txop_per_ap_data_duration = per_ap_txop_limit;
+			}
+			// Enforce IEEE 802.11ax per-PPDU duration limit
+			if (mapc_txop_per_ap_data_duration > IEEE_AX_MAX_PPDU_DURATION)
+				mapc_txop_per_ap_data_duration = IEEE_AX_MAX_PPDU_DURATION;
+		}
+		// Track TXOP sharing durations (Co-TDMA)
+		if (paper_replay.enabled) {
+			double available=mapc_txop_data_budget;
+			if (paper_replay.sharing_policy==2) {
+				// Estimate own demand at the CURRENT post-ICR DATA bandwidth, not
+				// the earlier ICF width. Reuse native aggregation/PHY duration functions.
+				int nch=0;
+				for (int ch=0;ch<NUM_CHANNELS_KOMONDOR;++ch) if(channels_for_tx[ch]==TRUE) ++nch;
+				if (nch<=0) { RestartNode(TRUE); return; }
+				double bits=GetNumberSubcarriers(nch)*Mcs_array::modulation_bits[7]
+					*Mcs_array::coding_rates[7]*IEEE_AX_SU_SPATIAL_STREAMS;
+				int count=std::min(buffer.QueueSize(),node_params.max_num_packets_aggregated);
+				count=FindMaximumPacketsAggregated(count,node_params.frame_length,bits);
+				double tr,tc,td,ta;
+				ComputeFramesDuration(&tr,&tc,&td,&ta,nch,8,count,node_params.frame_length,bits);
+				printf("PAPER_BW_DEMAND;time=%.12f;node=%d;old=%.12f;current=%.12f;channels=%d\n",
+					SimTime(),node_params.node_id,paper_replay.own_need,td,nch);
+				paper_replay.own_need=td;
+				mapc_txop_per_ap_data_duration=std::min(paper_replay.own_need,available);
+				paper_replay.peer_budget=mapc_peer_has_data ?
+					std::min(mapc_icr_requested_duration,std::max(0.0,available-mapc_txop_per_ap_data_duration)) : 0;
+				if (paper_replay.peer_budget<=0) mapc_peer_has_data=false;
+			} else {
+				mapc_txop_per_ap_data_duration=available/(mapc_peer_has_data ? 2.0 : 1.0);
+				paper_replay.peer_budget=mapc_peer_has_data ? mapc_txop_per_ap_data_duration : 0;
+			}
+			printf("PAPER_GRANT;time=%.12f;node=%d;peer=%d;ac=%d;policy=%d;limit=%.12f;available=%.12f;own=%.12f;peer_budget=%.12f;requested=%.12f;start=%.12f\n",
+				SimTime(),node_params.node_id,mapc_selected_peer_id,paper_edca.active_ac,
+				paper_replay.sharing_policy,paper_replay.txop_limit,available,
+				mapc_txop_per_ap_data_duration,paper_replay.peer_budget,mapc_icr_requested_duration,paper_replay.txop_start);
+			if (mapc_txop_per_ap_data_duration+paper_replay.peer_budget>available+1e-10)
+				throw std::runtime_error("Co-TDMA allocation exceeds TXOP data budget");
+		}
+		if (tdma_pilot.enabled) {
+			if (tdma_pilot.own_s()+tdma_pilot.peer_s()
+					+2*rts_duration+cts_duration+2*ack_duration+6*SIFS > IEEE_AX_MAX_PPDU_DURATION)
+				throw std::runtime_error("TDMA DATA budget plus overhead exceeds TXOP bound");
+			mapc_txop_per_ap_data_duration = tdma_pilot.own_s();
+			printf("TDMA_GRANT;time=%.15f;node=%d;peer=%d;own_s=%.15f;peer_s=%.15f;peer_has_data=%d\n",
+				SimTime(), node_params.node_id, mapc_selected_peer_id,
+				tdma_pilot.own_s(), tdma_pilot.peer_s(), mapc_peer_has_data);
+		}
+		printf("AUDIT_TDMA;time=%.15f;node=%d;peer=%d;peer_has_data=%d;own_budget_s=%.12g;peer_budget_s=%.12g;fallback=%d\n",
+			SimTime(), node_params.node_id, mapc_selected_peer_id, mapc_peer_has_data,
+			mapc_txop_per_ap_data_duration, mapc_peer_has_data ? mapc_txop_per_ap_data_duration : 0.0,
+			mapc_time_sharing_fallback);
+		node_stats.total_mapc_data_duration_own += mapc_txop_per_ap_data_duration;
+		if (mapc_peer_has_data)
+			node_stats.total_mapc_data_duration_shared += mapc_txop_per_ap_data_duration;
+		ObserveAp("rule_allocation");
+		if (mapc_time_sharing_fallback) {
+			// Peer currently waits for TF, not MU-RTS. Negotiate the fallback explicitly
+			// before sending coordinator DATA; peer will wait for its sequential grant.
+			node_state = STATE_TX_TF;
+			current_tx_duration = rts_duration;
+			tf_notification = GenerateNotification(PACKET_TYPE_TF, NODE_ID_MAPC_BROADCAST,
+				icf_notification.packet_id, 0, SimTime(), current_tx_duration);
+			tf_notification.mapc_group_id = wlan.mapc_group_ids[mapc_active_group_idx];
+			tf_notification.tx_info.mapc_allocated_data_duration = mapc_txop_per_ap_data_duration;
+			ScheduleTransmission(PACKET_TYPE_TF);
+		} else {
+			PrepareNewTransmission();
+		}
+	} else {
+		// Co-BF / Co-SR
+		if (!mapc_peer_has_data) {
+			// Peer has no data: skip TF, coordinator transmits DATA alone
+			LOGS(node_params.save_node_logs, node_logger.file,
+				"%.15f;N%d;S%d;%s;%s ICR: peer N%d has no data; skipping TF, transmitting solo\n",
+				SimTime(), node_params.node_id, node_state, LOG_F04, LOG_LVL3,
+				mapc_selected_peer_id);
+			exchange_sequence = IEEE_802_11_NO_RTS_CTS;
+			SelectDestination();
+			// Apply STA BW cap for coordinator solo DATA (ICF used full BSS BW; DATA is unicast).
+			{
+				int eff_min = node_params.min_channel_allowed;
+				int eff_max = node_params.max_channel_allowed;
+				if (current_destination_id >= 0) {
+					int sta_min_ch, sta_max_ch;
+					wlan.GetStaChannelBounds(current_destination_id, &sta_min_ch, &sta_max_ch);
+					if (sta_min_ch >= 0 && sta_min_ch > eff_min) eff_min = sta_min_ch;
+					if (sta_max_ch >= 0 && sta_max_ch < eff_max) eff_max = sta_max_ch;
+				}
+				GetChannelOccupancyByCCA(node_params.current_primary_channel, node_params.pifs_activated,
+					channels_free, eff_min, eff_max,
+					&channel_power, current_pd, timestamp_channel_becomes_free, SimTime(), PIFS);
+				GetTxChannels(channels_for_tx, node_params.current_dcb_policy, channels_free,
+					eff_min, eff_max, node_params.current_primary_channel,
+					NUM_CHANNELS_KOMONDOR, &channel_power, channel_aggregation_cca_model, NULL);
+			}
+			limited_num_packets_aggregated = 0;
+			mapc_txop_per_ap_data_duration = 0.0;
+			node_stats.total_mapc_data_duration_own += data_duration;
+			PrepareNewTransmission();
+		} else {
+			// Peer has data: send TF to trigger simultaneous DATA
+
+			// Co-SR only: power limits already computed above (feasibility-gated)
+			if (wlan.mapc_method_ids[mapc_active_group_idx] == CO_SR) {
+				sr_state.current_tx_power_sr = cosr_coord_pW;
+				sr_state.mapc_cosr_active    = TRUE;
+				for (int n = 0; n < wlan.num_stas; ++n) change_modulation_flag[n] = TRUE;
+			}
+
+			// Negotiate aligned TXOP duration: max(coordinator's need, peer's request), capped by MAX_PPDU
+			double mapc_agreed_data_duration = (mapc_icr_requested_duration > data_duration)
+				? mapc_icr_requested_duration : data_duration;
+			if (mapc_agreed_data_duration > IEEE_AX_MAX_PPDU_DURATION)
+				mapc_agreed_data_duration = IEEE_AX_MAX_PPDU_DURATION;
+			// Both coordinator and coordinated AP will cap/pad to this agreed duration
+			mapc_txop_per_ap_data_duration = mapc_agreed_data_duration;
+
+			node_state = STATE_TX_TF;
+			++node_stats.num_tf_tx;
+			node_stats.total_mapc_data_duration_own    += data_duration;
+			node_stats.total_mapc_data_duration_shared += data_duration;
+			current_tx_duration = rts_duration;
+
+			// TF is a control frame; data buffer is managed at DATA preparation phase
+			tf_notification = GenerateNotification(PACKET_TYPE_TF, NODE_ID_MAPC_BROADCAST,
+				last_packet_generated_id, limited_num_packets_aggregated,
+				SimTime(), current_tx_duration);
+			tf_notification.mapc_group_id                       = wlan.mapc_group_ids[mapc_active_group_idx];
+			tf_notification.tx_info.mapc_sr_peer_tx_power       = cosr_peer_pW;
+			// Carry agreed TXOP duration so both APs align start and end
+			tf_notification.tx_info.mapc_allocated_data_duration = mapc_agreed_data_duration;
+
+			sr_state.flag_change_in_tx_power = FALSE;
+			ScheduleTransmission(PACKET_TYPE_TF);
+		}
+	}
+}
+
+/**
+ * HandleFinishTX_StateRxMuRts: coordinated AP (Co-TDMA) received MU-RTS/TXS, starts DATA
+ */
+void Node :: HandleFinishTX_StateRxMuRts(const Notification &notification) {
+	if (notification.packet_type != PACKET_TYPE_MU_RTS_TXS
+			|| notification.destination_id != node_params.node_id
+            || notification.source_id != coordinator_ap_id
+            || notification.mapc_group_id != wlan.mapc_group_ids[mapc_active_group_idx]) return;
+
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s MU-RTS/TXS done, starting DATA exchange\n",
+		SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3);
+
+	// Coordinated AP uses 2-way DATA/ACK for its TDMA slot
+	exchange_sequence = IEEE_802_11_NO_RTS_CTS;
+	SelectDestination();
+	// Cap channel range to the destination STA's declared bandwidth.
+	{
+		int eff_min = node_params.min_channel_allowed;
+		int eff_max = node_params.max_channel_allowed;
+		if (current_destination_id >= 0) {
+			int sta_min_ch, sta_max_ch;
+			wlan.GetStaChannelBounds(current_destination_id, &sta_min_ch, &sta_max_ch);
+			if (sta_min_ch >= 0 && sta_min_ch > eff_min) eff_min = sta_min_ch;
+			if (sta_max_ch >= 0 && sta_max_ch < eff_max) eff_max = sta_max_ch;
+		}
+		// Use DCB to determine the channel range, mirroring the coordinator's EndBackoff path.
+		GetChannelOccupancyByCCA(node_params.current_primary_channel, node_params.pifs_activated,
+			channels_free, eff_min, eff_max,
+			&channel_power, current_pd, timestamp_channel_becomes_free, SimTime(), PIFS);
+		GetTxChannels(channels_for_tx, node_params.current_dcb_policy, channels_free,
+			eff_min, eff_max, node_params.current_primary_channel,
+			NUM_CHANNELS_KOMONDOR, &channel_power, channel_aggregation_cca_model, NULL);
+	}
+	if (channels_for_tx[0] == TX_NOT_POSSIBLE) {
+		RestartNode(TRUE);
+		return;
+	}
+	{
+		int ix_dest (current_destination_id - wlan.list_sta_id[0]);
+		if (change_modulation_flag[ix_dest]) {
+			LOGS(node_params.save_node_logs, node_logger.file,
+				"%.15f;N%d;S%d;%s;%s MU-RTS: first TDMA slot, requesting MCS for N%d\n",
+				SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3,
+				current_destination_id);
+			RequestMCS();
+		}
+	}
+	// Apply per-AP duration allocation from coordinator's MU-RTS
+	mapc_txop_per_ap_data_duration = notification.tx_info.mapc_allocated_data_duration;
+	if (tdma_pilot.enabled && fabs(mapc_txop_per_ap_data_duration-tdma_pilot.own_s()) > 1e-10)
+		throw std::runtime_error("Peer received wrong TDMA grant");
+	if (mapc_txop_per_ap_data_duration > IEEE_AX_MAX_PPDU_DURATION)
+		mapc_txop_per_ap_data_duration = IEEE_AX_MAX_PPDU_DURATION;
+	++node_stats.num_mu_rts_rx;
+	node_stats.total_mapc_data_duration_allocated += mapc_txop_per_ap_data_duration;
+    ObserveAp("peer_grant_received", &notification);
+	PrepareNewTransmission();
+}
+
+/**
+ * HandleFinishTX_StateRxTf: coordinated AP (Co-BF/Co-SR) received TF, starts simultaneous DATA
+ */
+void Node :: HandleFinishTX_StateRxTf(const Notification &notification) {
+	if (notification.packet_type != PACKET_TYPE_TF
+			|| notification.mapc_group_id != wlan.mapc_group_ids[mapc_active_group_idx]) return;
+	if (notification.tx_info.mapc_time_sharing_fallback) {
+		mapc_time_sharing_active = true;
+		sr_state.mapc_cosr_active = FALSE;
+		mapc_txop_per_ap_data_duration = notification.tx_info.mapc_allocated_data_duration;
+		node_state = STATE_WAIT_MU_RTS;
+		time_to_trigger = SimTime() + SIFS + mapc_txop_per_ap_data_duration + SIFS
+			+ ack_duration + SIFS + TIME_OUT_EXTRA_TIME;
+		trigger_NAV_timeout.Set(FixTimeOffset(time_to_trigger, 13, 12));
+		printf("FIX_FALLBACK_PEER;time=%.15f;node=%d;coordinator=%d;state=%d\n",
+			SimTime(), node_params.node_id, coordinator_ap_id, node_state);
+		return;
+	}
+
+	LOGS(node_params.save_node_logs, node_logger.file,
+		"%.15f;N%d;S%d;%s;%s TF done, starting simultaneous DATA transmission\n",
+		SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3);
+
+	// Coordinated AP transmits DATA simultaneously with coordinator
+	exchange_sequence = IEEE_802_11_NO_RTS_CTS;
+	SelectDestination();
+	// Cap channel range to the destination STA's declared bandwidth.
+	{
+		int eff_min = node_params.min_channel_allowed;
+		int eff_max = node_params.max_channel_allowed;
+		if (current_destination_id >= 0) {
+			int sta_min_ch, sta_max_ch;
+			wlan.GetStaChannelBounds(current_destination_id, &sta_min_ch, &sta_max_ch);
+			if (sta_min_ch >= 0 && sta_min_ch > eff_min) eff_min = sta_min_ch;
+			if (sta_max_ch >= 0 && sta_max_ch < eff_max) eff_max = sta_max_ch;
+		}
+		// Use DCB to determine the channel range, mirroring the coordinator's EndBackoff path.
+		GetChannelOccupancyByCCA(node_params.current_primary_channel, node_params.pifs_activated,
+			channels_free, eff_min, eff_max,
+			&channel_power, current_pd, timestamp_channel_becomes_free, SimTime(), PIFS);
+		GetTxChannels(channels_for_tx, node_params.current_dcb_policy, channels_free,
+			eff_min, eff_max, node_params.current_primary_channel,
+			NUM_CHANNELS_KOMONDOR, &channel_power, channel_aggregation_cca_model, NULL);
+	}
+	if (channels_for_tx[0] == TX_NOT_POSSIBLE) {
+		RestartNode(TRUE);
+		return;
+	}
+	// Co-SR: apply the TX power limit assigned by the coordinator in the TF
+	limited_num_packets_aggregated = 0;   // prevent stale-packet flush on first call
+	if (wlan.mapc_method_ids[mapc_active_group_idx] == CO_SR) {
+		sr_state.current_tx_power_sr = notification.tx_info.mapc_sr_peer_tx_power;
+		sr_state.mapc_cosr_active    = TRUE;
+		for (int n = 0; n < wlan.num_stas; ++n) change_modulation_flag[n] = TRUE;
+	}
+	{
+		int ix_dest (current_destination_id - wlan.list_sta_id[0]);
+		if (change_modulation_flag[ix_dest]) {
+			LOGS(node_params.save_node_logs, node_logger.file,
+				"%.15f;N%d;S%d;%s;%s TF: first slot, requesting MCS for N%d\n",
+				SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3,
+				current_destination_id);
+			RequestMCS();
+		}
+	}
+	// Apply the coordinator's data_duration as the TXOP slot for this AP.
+	// PrepareNewTransmission will cap packets (if over-budget) or pad data_duration
+	// (if under-budget) so that both APs' DATA frames end at the same time.
+	mapc_txop_per_ap_data_duration = notification.tx_info.mapc_allocated_data_duration;
+	if (mapc_txop_per_ap_data_duration > IEEE_AX_MAX_PPDU_DURATION)
+		mapc_txop_per_ap_data_duration = IEEE_AX_MAX_PPDU_DURATION;
+	++node_stats.num_tf_rx;
+	node_stats.total_mapc_data_duration_allocated += mapc_txop_per_ap_data_duration;
+	PrepareNewTransmission();
+}
+
+/**
+ * HandleFinishTX_StateWaitAckTf: handles ACK TF reception for STAs.
+ */
+void Node :: HandleFinishTX_StateWaitAckTf(const Notification &notification) {
+	if (notification.packet_type != PACKET_TYPE_ACK_TF
+			|| wlan.FindMapcGroupIdx(notification.mapc_group_id) < 0) return;
+	// Ignore an ACK TF from an AP other than our own (the other WLAN's coordinator or
+	// coordinated AP, sequentially triggering its own STA, not us).
+	if (notification.source_id != wlan.ap_id) return;
+
+	trigger_DATA_timeout.Cancel();
+
+	if (node_params.node_type == NODE_TYPE_AP) {
+		// Fallback: an AP should no longer reach STATE_WAIT_ACK_TF under the
+		// sequential ACK flow, but keep prior behavior in case it ever does.
+		time_to_trigger = SimTime() + SIFS + TIME_OUT_EXTRA_TIME;
+		trigger_ACK_timeout.Set(FixTimeOffset(time_to_trigger, 13, 12));
+		node_state = STATE_WAIT_ACK;
+		LOGS(node_params.save_node_logs, node_logger.file,
+			"%.15f;N%d;S%d;%s;%s ACK TF received. Waiting for ACK from own STA (N%d).\n",
+			SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3, current_destination_id);
+	} else if (mapc_pending_ack_valid) {
+		// STA: own AP's ACK TF received -- send ACK to own AP after SIFS
+		node_state = STATE_TX_ACK;
+		time_to_trigger = SimTime() + SIFS;
+		trigger_SIFS.Set(FixTimeOffset(time_to_trigger, 13, 12));
+		LOGS(node_params.save_node_logs, node_logger.file,
+			"%.15f;N%d;S%d;%s;%s ACK TF received. Sending ACK to N%d after SIFS.\n",
+			SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3, current_destination_id);
+	} else {
+		// Should not normally be reachable, kept as a fallback.
+		LOGS(node_params.save_node_logs, node_logger.file,
+			"%.15f;N%d;S%d;%s;%s ACK TF received but no valid pending reception for this TXOP "
+			"(already lost/restarted). Ignoring and restarting.\n",
+			SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3);
+		RestartNode(FALSE);
+	}
+}
+
+#endif /* NODE_PACKET_METHODS_H */

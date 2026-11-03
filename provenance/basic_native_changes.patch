@@ -1,0 +1,712 @@
+--- a/Code/main/komondor_main.cc
++++ b/Code/main/komondor_main.cc
+@@ -466,6 +466,7 @@
+     std::string mapc_input_filename = "";       // Optional
+     std::string script_output_filename = "../output/default_output.txt";
+     std::string simulation_code = "SIM_001";
++    std::string state_directory;
+     
+     int save_node_logs = 0;
+     int save_agent_logs = 0;
+@@ -490,6 +491,7 @@
+         {"seed",      required_argument, 0, 's'},
+         {"code",      required_argument, 0, 'c'},
+         {"out",       required_argument, 0, 'o'},
++        {"state-dir", required_argument, 0, 'q'},
+ 
+         // Optional Features (Modes)
+         {"agents",    required_argument, 0, 'a'}, // Providing this ENABLES agents
+@@ -512,13 +514,14 @@
+     int opt;
+     int option_index = 0;
+ 
+-    while ((opt = getopt_long(argc, argv, "n:t:s:c:o:a:m:L:l:S:A:h", long_options, &option_index)) != -1) {
++    while ((opt = getopt_long(argc, argv, "n:t:s:c:o:a:m:L:l:S:A:q:h", long_options, &option_index)) != -1) {
+         switch (opt) {
+             case 'n': nodes_input_filename = optarg; break;
+             case 't': sim_time = atof(optarg); break;
+             case 's': seed = atoi(optarg); break;
+             case 'c': simulation_code = optarg; break;
+             case 'o': script_output_filename = optarg; break;
++            case 'q': state_directory = optarg; break;
+             
+             // Auto-enable modes if file is provided
+             case 'a': 
+@@ -541,6 +544,7 @@
+                 printf("Usage: ./Komondor --nodes <file> [OPTIONS]\n");
+                 printf("  --nodes <file>   : Input nodes file (Required)\n");
+                 printf("  --out <file>     : Output file (Default: ../output/default_output.txt)\n");
++                printf("  --state-dir <dir>: New directory for independent ap_<id>.jsonl state files\n");
+                 printf("  --time <sec>     : Sim time (Default: 10.0)\n");
+                 printf("  --code <str>     : Simulation code (Default: SIM_001)\n");
+                 printf("  --seed <int>	   : Random seed (Default: 1)\n");
+@@ -584,6 +588,19 @@
+     // 5. RUN SIMULATION
+     // -------------------------------------------------------
+ 
++    unsetenv("KOMONDOR_AP_STATE_DIR");
++    if (!state_directory.empty()) {
++        if (agents_enabled || getenv("WIFI8_PAPER_TRACE") || getenv("WIFI8_TDMA_PLAN")) {
++            fprintf(stderr,"ERROR: --state-dir observes native rule-based runs only\n");
++            return EXIT_FAILURE;
++        }
++        if (mkdir(state_directory.c_str(),0777)!=0) {
++            fprintf(stderr,"ERROR: --state-dir must be a new writable directory\n");
++            return EXIT_FAILURE;
++        }
++        if (setenv("KOMONDOR_AP_STATE_DIR",state_directory.c_str(),1)!=0) return EXIT_FAILURE;
++    }
++    try {
+     Komondor komondor_simulation;
+ 
+ 	// COST uses drand48() globally. The CLI seed was previously only stored and
+@@ -619,5 +636,9 @@
+     komondor_simulation.Run();
+ 
+     return 0;
++    } catch (const std::exception &error) {
++        fprintf(stderr,"ERROR: %s\n",error.what());
++        return EXIT_FAILURE;
++    }
+ 
+ };
+--- a/Code/main/node.h
++++ b/Code/main/node.h
+@@ -66,6 +66,7 @@
+ #include "../structures/logger.h"
+ #include "../structures/FIFO.h"
+ #include "../structures/mpdu_transaction.h"
++#include "../structures/ap_observation.h"
+ #include "../structures/tdma_pilot.h"
+ #include "../structures/paper_replay.h"
+ #include "../structures/paper_edca.h"
+@@ -204,6 +205,9 @@
+ 
+ 		// Specific to a node
+ 		FIFO buffer;					///> FIFO buffer (contains Notifications)
++		ApObservation ap_observation;
++		unsigned long full_buffer_replaced;
++		void ObserveAp(const char *event, const Notification *frame=0);
+ 		TdmaPilot tdma_pilot;
+ 		PaperReplay paper_replay;
+ 		PaperEdca paper_edca;
+@@ -227,10 +231,10 @@
+ 
+ 		// MAPC coordinator state
+ 		int  num_coordinated_aps;				///> # of coordinated APs invited for current TXOP
+-		int  coordinated_ap_ids[8];				///> Their node_ids
++		std::vector<int> coordinated_ap_ids;				///> Their node_ids
+ 		int  mapc_seq_pos;						///> Current position in exchange_sequence.frame_types
+ 		int  mapc_icr_received_count;			///> # of ICRs received so far
+-		int  mapc_current_peer_idx;				///> Round-robin counter: index into coordinated_ap_ids[]
++		unsigned long mapc_current_peer_idx[MAX_MAPC_GROUPS_PER_WLAN];				///> Round-robin counter: index into coordinated_ap_ids[]
+ 		int  mapc_selected_peer_id;				///> node_id of the AP targeted in the current TXOP
+ 		int  mapc_peer_has_data;				///> TRUE if selected peer reported data in its ICR
+ 		double mapc_txop_data_budget;			///> Total DATA duration available for this TXOP (set at ICF time)
+@@ -571,6 +575,13 @@
+ 
+ 	// Initialize variables
+ 	InitializeVariables();
++	if (node_params.node_type==NODE_TYPE_AP) {
++        if (std::getenv("KOMONDOR_AP_STATE_DIR"))
++            for (int g=0;g<wlan.num_mapc_groups;++g)
++                if (wlan.mapc_method_ids[g]!=CO_TDMA)
++                    throw std::runtime_error("AP state output currently supports native Co-TDMA/CSMA only");
++        ap_observation.open(node_params.node_id);
++    }
+ 	if (node_params.node_type == NODE_TYPE_AP) {
+ 		tdma_pilot.load(node_params.node_id);
+ 		if (tdma_pilot.enabled) {
+@@ -589,6 +600,8 @@
+ 		}
+ 	}
+ 
++	ObserveAp("ready");
++
+ 	// Create node logs file if required
+ 	node_logger.file = NULL;
+ 	if(node_params.save_node_logs) {
+@@ -646,6 +659,8 @@
+  * Stop()
+  */
+ void Node :: Stop(){
++	ObserveAp("final");
++	ap_observation.close();
+ 	if (dl_cfend.enabled) printf("DL_CFEND_FINAL;node=%d;sent=%lu;received=%lu;released=%lu;lost=%lu;skipped=%lu\n",
+ 		node_params.node_id,dl_cfend.sent,dl_cfend.received,dl_cfend.released,dl_cfend.lost,dl_cfend.skipped);
+ 	if (paper_replay.enabled) {
+@@ -800,7 +815,7 @@
+ 	num_coordinated_aps     = 0;
+ 	mapc_seq_pos            = 0;
+ 	mapc_icr_received_count = 0;
+-	mapc_current_peer_idx   = 0;
++	for (int g=0;g<MAX_MAPC_GROUPS_PER_WLAN;++g) mapc_current_peer_idx[g]=0;
+ 	mapc_selected_peer_id   = NODE_ID_NONE;
+ 	mapc_peer_has_data      = TRUE;          // conservative: assume peer has data until told otherwise
+ 	mapc_txop_data_budget            = 0.0;
+@@ -827,6 +842,8 @@
+ 	max_pw_interference = 0;
+ 	node_stats.rts_lost_slotted_bo = 0;
+ 	last_packet_generated_id = 0;
++	full_buffer_replaced = 0;
++	current_destination_id = NODE_ID_NONE;
+ 
+ 	node_stats.num_delay_measurements = 0;
+ 	node_stats.sum_delays = 0;
+--- a/Code/main/traffic_generator.h
++++ b/Code/main/traffic_generator.h
+@@ -191,8 +191,8 @@
+ 
+ 		// 2
+ 		case TRAFFIC_DETERMINISTIC:{
+-			int lambda = 10000;
+-			time_for_next_packet = 1/lambda;
++			if (traffic_load<=0) break;
++			time_for_next_packet = 1.0/traffic_load;
+ 			time_to_trigger = SimTime() + time_for_next_packet;
+ 			trigger_new_packet_generated.Set(FixTimeOffset(time_to_trigger,13,12));
+ 			break;
+--- a/Code/methods/frames/notification_methods.h
++++ b/Code/methods/frames/notification_methods.h
+@@ -101,6 +101,7 @@
+ 
+ 	// Beamforming fields — overwritten by GenerateNotification() when beamforming_enabled
+ 	tx_info.beamforming_active = BEAMFORMING_DISABLED;
++	tx_info.beam_use_zf = 0;
+ 	tx_info.beam_N_elements    = DEFAULT_BEAM_N_ELEMENTS;
+ 	tx_info.beam_d_spacing     = DEFAULT_BEAM_D_SPACING;
+ 	tx_info.beam_az_main_rad   = 0.0;
+--- a/Code/methods/node/node_backoff_methods.h
++++ b/Code/methods/node/node_backoff_methods.h
+@@ -225,6 +225,7 @@
+  * @param "called_by_time_out" [type int]: indicated whether this method was called after a timeout or not
+  */
+ void Node :: RestartNode(int called_by_time_out){
++	ObserveAp(called_by_time_out ? "timeout_restart" : "restart");
+ 	if (dl_cfend.enabled && !dl_cfend.holding) dl_cfend.round=DlRound();
+ 	if (paper_replay.enabled) paper_edca.release(SimTime(),called_by_time_out!=0);
+ 	if (paper_replay.enabled) {
+--- a/Code/methods/node/node_fsm_methods.h
++++ b/Code/methods/node/node_fsm_methods.h
+@@ -253,6 +253,8 @@
+ 							&& wlan.mapc_peer_ap_ids[mapc_active_group_idx][i] < node_params.node_id)
+ 						++mapc_peer_position;
+ 				}
++				// One addressed peer responds in Co-TDMA, even when the group contains many APs.
++				if (wlan.mapc_method_ids[mapc_active_group_idx]==CO_TDMA) mapc_peer_position=0;
+ 				if (node_is_transmitter) PauseBackoff();
+ 				LOGS(node_params.save_node_logs, node_logger.file,
+ 					"%.15f;N%d;S%d;%s;%s Received ICF from N%d -> STATE_RX_ICF (pos=%d)\n",
+@@ -2306,7 +2308,7 @@
+ 									"%.15f;N%d;S%d;%s;%s N%d has no data (ICR flag); skipping MU-RTS slot\n",
+ 									SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3,
+ 									mapc_selected_peer_id);
+-								++mapc_current_peer_idx;
++								++mapc_current_peer_idx[mapc_active_group_idx];
+ 								if (dl_cfend.enabled && dl_cfend.round.valid()) QueueDlCfEnd();
+ 								else RestartNode(FALSE);
+ 							}
+--- a/Code/methods/node/node_impl.h
++++ b/Code/methods/node/node_impl.h
+@@ -28,6 +28,7 @@
+ #ifndef NODE_IMPL_H
+ #define NODE_IMPL_H
+ 
++#include "node_observation_methods.h"
+ #include "node_statistics_methods.h"
+ #include "node_config_methods.h"
+ #include "node_spatial_reuse_methods.h"
+--- a/Code/methods/node/node_mcs_methods.h
++++ b/Code/methods/node/node_mcs_methods.h
+@@ -372,6 +372,7 @@
+ 			}
+ 
+ 		} // End of BURST TRAFFIC
++		ObserveAp("arrival");
+ 
+ 	}
+ }
+--- /dev/null
++++ b/Code/methods/node/node_observation_methods.h
+@@ -0,0 +1,84 @@
++// Node implementation fragment: included once from node_impl.h. Local AP state only.
++#ifndef KOMONDOR_NODE_OBSERVATION_METHODS_H
++#define KOMONDOR_NODE_OBSERVATION_METHODS_H
++void Node :: ObserveAp(const char *event, const Notification *frame) {
++    if (!ap_observation.enabled()) return;
++    const double now=SimTime();
++    if (std::string(event)=="access_won") { ap_observation.report_source=-1; ap_observation.report_time_s=-1; ap_observation.allocation_valid=false; }
++    if (frame && frame->packet_type==PACKET_TYPE_ICR && frame->destination_id==node_params.node_id) {
++        ap_observation.report_source=frame->source_id;
++        ap_observation.report_time_s=now;
++        ap_observation.report_has_data=frame->mapc_has_data!=0;
++    }
++    if (std::string(event)=="rule_allocation" || std::string(event)=="solo_fallback"
++            || std::string(event)=="peer_grant_received") ap_observation.allocation_valid=true;
++    const bool active=(node_state!=STATE_SENSING && node_state!=STATE_NAV) || std::string(event)=="access_won";
++    const bool group=active && wlan.mapc_enabled && mapc_active_group_idx>=0
++        && mapc_active_group_idx<wlan.num_mapc_groups;
++    double oldest=0;
++    for (unsigned int i=0;i<buffer.m_queue.size();++i)
++        oldest=std::max(oldest,std::max(0.0,now-buffer.m_queue[i].timestamp_generated));
++    long balance=(long)node_stats.num_packets_generated-(long)node_stats.num_packets_dropped
++        -(long)full_buffer_replaced-(long)tx_mpdu.acknowledged.size()-buffer.TotalQueueSize();
++    double backoff=ca_state.remaining_backoff;
++    if (trigger_end_backoff.Active()) backoff=std::max(0.0,trigger_end_backoff.GetTime()-now);
++    const bool data_pending=node_state==STATE_TX_DATA || node_state==STATE_WAIT_ACK || node_state==STATE_RX_ACK;
++    std::ostringstream out; out << std::setprecision(17);
++    out << "\"event\":" << ApJsonString(event) << ",\"time_s\":" << ApJsonNumber(now)
++        << ",\"ap_id\":" << node_params.node_id << ",\"wlan_code\":" << ApJsonString(wlan.wlan_code)
++        << ",\"state_id\":" << node_state << ",\"state_name\":" << ApJsonString(ApStateName(node_state))
++        << ",\"role\":" << ApJsonString(!group ? (node_state==STATE_NAV ? "deferring" : "contending") : coordinator_ap_id==NODE_ID_NONE ? "coordinator" : "participant")
++        << ",\"traffic_model\":" << node_params.traffic_model << ",\"traffic_ac\":" << current_traffic_type
++        << ",\"rule\":" << ApJsonString(wlan.mapc_enabled ? "equal_split_round_robin" : "csma_ca") << ",\"mapc_enabled\":" << (wlan.mapc_enabled ? "true" : "false")
++        << ",\"configured_group_ids\":[";
++    for (int g=0;g<wlan.num_mapc_groups;++g) { if (g) out << ','; out << wlan.mapc_group_ids[g]; }
++    out << "],\"associated_sta_ids\":[";
++    for (int sta=0;sta<wlan.num_stas;++sta) { if (sta) out << ','; out << wlan.list_sta_id[sta]; }
++    out << "],\"group_id\":";
++    if (group) out << wlan.mapc_group_ids[mapc_active_group_idx]; else out << "null";
++    out << ",\"coordinator_id\":";
++    if (group) out << (coordinator_ap_id==NODE_ID_NONE ? node_params.node_id : coordinator_ap_id); else out << "null";
++    out << ",\"selected_peer_id\":";
++    if (group && coordinator_ap_id==NODE_ID_NONE && mapc_selected_peer_id>=0) out << mapc_selected_peer_id; else out << "null";
++    out << ",\"peer_slot_active\":" << ((!group || coordinator_ap_id!=NODE_ID_NONE || !ap_observation.allocation_valid)
++        ? "null" : mapc_peer_has_data ? "true" : "false");
++    out << ",\"destination_id\":" << current_destination_id
++        << ",\"queue_packets\":" << buffer.TotalQueueSize()
++        << ",\"selected_queue_packets\":" << buffer.QueueSize()
++        << ",\"queue_hol_age_s\":" << ApJsonNumber(oldest)
++        << ",\"generated_mpdus\":" << node_stats.num_packets_generated
++        << ",\"overflow_mpdus\":" << node_stats.num_packets_dropped
++        << ",\"source_replaced_mpdus\":" << full_buffer_replaced
++        << ",\"acked_mpdus\":" << tx_mpdu.acknowledged.size()
++        << ",\"ledger_balance\":" << balance
++        << ",\"in_flight_mpdus\":" << (data_pending ? tx_mpdu.pending.size() : 0)
++        << ",\"cw_min\":" << ca_state.current_cw_min << ",\"cw_max\":" << ca_state.current_cw_max
++        << ",\"backoff_remaining_s\":" << ApJsonNumber(backoff)
++        << ",\"nav_until_s\":";
++    if (trigger_NAV_timeout.Active()) out << ApJsonNumber(trigger_NAV_timeout.GetTime()); else out << "null";
++    out << ",\"primary_channel\":" << node_params.current_primary_channel
++        << ",\"channel_power_pw\":" << ApJsonNumber(channel_power[node_params.current_primary_channel])
++        << ",\"sensitivity_pw\":" << ApJsonNumber(current_pd)
++        << ",\"tx_power_total_pw\":" << ApJsonNumber(current_tx_power)
++        << ",\"mcs\":";
++    if (num_channels_tx>0 && current_modulation>0) out << current_modulation-1; else out << "null";
++    out << ",\"channel_left\":" << current_left_channel << ",\"channel_right\":" << current_right_channel
++        << ",\"own_data_budget_valid\":" << ((group && ap_observation.allocation_valid) ? "true" : "false")
++        << ",\"own_data_budget_s\":" << ApJsonNumber(group && ap_observation.allocation_valid ? mapc_txop_per_ap_data_duration : 0)
++        << ",\"peer_report\":";
++    // Only a successfully received ICR from the selected peer can supply peer information.
++    if (group && coordinator_ap_id==NODE_ID_NONE && ap_observation.report_source==mapc_selected_peer_id
++            && ap_observation.report_time_s>=0) {
++        out << "{\"source_id\":" << ap_observation.report_source << ",\"received_at_s\":" << ApJsonNumber(ap_observation.report_time_s)
++            << ",\"has_data\":" << (ap_observation.report_has_data ? "true" : "false") << '}';
++    } else out << "null";
++    out << ",\"frame\":";
++    if (frame) {
++        out << "{\"type\":" << frame->packet_type << ",\"source_id\":" << frame->source_id
++            << ",\"destination_id\":" << frame->destination_id << ",\"duration_s\":" << ApJsonNumber(frame->tx_duration)
++            << ",\"mpdus\":" << frame->tx_info.num_packets_aggregated
++            << ",\"mcs\":" << (frame->packet_type==PACKET_TYPE_DATA ? frame->modulation_id-1 : -1) << '}';
++    } else out << "null";
++    ap_observation.write(out.str());
++}
++#endif
+--- a/Code/methods/node/node_packet_methods.h
++++ b/Code/methods/node/node_packet_methods.h
+@@ -120,6 +120,7 @@
+ 	notification.tx_info.flag_change_in_tx_power = notification.tx_info.flag_change_in_tx_power
+ 		|| last_emitted_tx_power_pw != notification.tx_info.tx_power;
+ 	last_emitted_tx_power_pw = notification.tx_info.tx_power;
++	ObserveAp("tx", &notification);
+ 	outportSelfStartTX(notification);
+ }
+ 
+@@ -161,6 +162,7 @@
+ 		PublishTdmaQueues();
+ 	}
+ 	tx_mpdu.commit();
++	ObserveAp("ack_commit");
+ 	limited_num_packets_aggregated = 0;
+ 	printf("FIX_COMMIT;time=%.15f;node=%d;count=%d;unique=%lu;queue=%d\n",
+ 		SimTime(), node_params.node_id, count, (unsigned long)tx_mpdu.acknowledged.size(), buffer.QueueSize());
+@@ -638,6 +640,8 @@
+ 			new_packet.packet_id = last_packet_generated_id;
+ 			buffer.PutPacket(new_packet);
+ 			++last_packet_generated_id;
++			++node_stats.num_packets_generated;
++			++performance_report.num_packets_generated;
+ 		}
+ 
+ 		// Set "last_transmission_successful" to 0 for the upcoming transmission
+@@ -780,9 +784,10 @@
+ 	}
+ 
+ 	//  - Delete / flush packets from the previous transmission
+-	if (node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION
+-			&& !(wlan.mapc_enabled && coordinator_ap_id == NODE_ID_NONE
+-				 && exchange_sequence.frame_types[0] != PACKET_TYPE_ICF)) {
++    const bool preserved_full_buffer = node_params.traffic_model==TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION
++        && wlan.mapc_enabled && coordinator_ap_id==NODE_ID_NONE
++        && exchange_sequence.frame_types[0]!=PACKET_TYPE_ICF;
++	if (node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION && !preserved_full_buffer) {
+ 		// Full-buffer: flush ALL stale packets before each new TXOP so that packets
+ 		// added by the previous InitiateBurstPackets call (which uses the pre-TXOP-cap
+ 		// lnpa, e.g. ~40) do not accumulate when the TXOP cap allows fewer transmissions
+@@ -791,6 +796,7 @@
+ 		// Exception: MAPC coordinator DATA path — buffer was pre-filled at ICF time;
+ 		// preserve those packets so the DATA lnpa is computed correctly.
+ 		while (buffer.QueueSize() > 0) {
++			++full_buffer_replaced; // Saturated source refresh, distinct from overflow or ACK.
+ 			buffer.DelFirstPacket();
+ 		}
+ 	}
+@@ -800,7 +806,8 @@
+ 		buffer.QueueSize(), PACKET_BUFFER_SIZE);
+ 
+ 	// - Number of packets to be aggregated: min(current buffer size, max num packets aggregated)
+-	if(buffer.QueueSize() > node_params.max_num_packets_aggregated || node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION){
++	if(buffer.QueueSize() > node_params.max_num_packets_aggregated
++            || (node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION && !preserved_full_buffer)){
+ 		current_num_packets_aggregated = node_params.max_num_packets_aggregated;
+ 	} else {
+ 		current_num_packets_aggregated = buffer.QueueSize();
+@@ -827,7 +834,7 @@
+ 	// Guard: abort if the buffer is empty for non-full-buffer traffic (e.g., Poisson).
+ 	// Transmitting 0 packets wastes the TXOP and produces invalid frame durations.
+ 	if (limited_num_packets_aggregated == 0
+-			&& node_params.traffic_model != TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION) {
++			&& (node_params.traffic_model != TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION || preserved_full_buffer)) {
+ 		LOGS(node_params.save_node_logs, node_logger.file,
+ 			"%.15f;N%d;S%d;%s;%s Buffer empty; aborting TX and restarting (no CW increase).\n",
+ 			SimTime(), node_params.node_id, node_state, LOG_E14, LOG_LVL3);
+@@ -885,6 +892,25 @@
+ 			ComputeFramesDuration(&rts_duration, &cts_duration, &data_duration, &ack_duration,
+ 				num_channels_tx, current_modulation, limited_num_packets_aggregated, node_params.frame_length, bits_ofdm_sym);
+ 		}
++        if (!paper_replay.enabled && !tdma_pilot.enabled
++                && wlan.mapc_method_ids[mapc_active_group_idx]==CO_TDMA
++                && data_duration>mapc_txop_per_ap_data_duration+1e-10) {
++            // A short native queue may contain just one MPDU. Half a DATA budget
++            // cannot then hold even its preamble. Decline sharing for this round;
++            // do not send an over-budget MPDU or invent extra reserved airtime.
++            if (coordinator_ap_id==NODE_ID_NONE) {
++                mapc_peer_has_data=FALSE;
++                double solo_limit=IEEE_AX_MAX_PPDU_DURATION-rts_duration-cts_duration-ack_duration-2*SIFS;
++                mapc_txop_per_ap_data_duration=std::max(0.0,std::min(mapc_txop_data_budget,solo_limit));
++                ObserveAp("solo_fallback");
++            }
++            if (data_duration>mapc_txop_per_ap_data_duration+1e-10) {
++                printf("TDMA_NO_FIT;time=%.12f;node=%d;single_mpdu_s=%.12f;grant_s=%.12f\n",
++                    SimTime(),node_params.node_id,data_duration,mapc_txop_per_ap_data_duration);
++                ObserveAp("no_fit");
++                RestartNode(FALSE); return;
++            }
++        }
+ 		if (paper_replay.enabled && data_duration > mapc_txop_per_ap_data_duration+1e-10) {
+ 			// The actual DCB width can shrink after ICF/ICR. Never transmit an MPDU
+ 			// that no longer fits the advertised allocation; retain it for retry.
+@@ -1286,14 +1312,15 @@
+ 		// Declare this node as coordinator for the upcoming TXOP
+ 		coordinator_ap_id = NODE_ID_NONE;
+ 		num_coordinated_aps = wlan.mapc_num_peers[mapc_active_group_idx];
++		coordinated_ap_ids.resize(num_coordinated_aps);
+ 		for (int i = 0; i < num_coordinated_aps; ++i)
+ 			coordinated_ap_ids[i] = wlan.mapc_peer_ap_ids[mapc_active_group_idx][i];
+ 		// Round-robin: select which coordinated AP to invite this TXOP
+-		mapc_selected_peer_id = coordinated_ap_ids[mapc_current_peer_idx % num_coordinated_aps];
++		mapc_selected_peer_id = coordinated_ap_ids[mapc_current_peer_idx[mapc_active_group_idx] % num_coordinated_aps];
+ 		LOGS(node_params.save_node_logs, node_logger.file,
+ 			"%.15f;N%d;S%d;%s;%s MAPC: selected peer N%d (round-robin idx %d)\n",
+ 			SimTime(), node_params.node_id, node_state, LOG_F02, LOG_LVL2,
+-			mapc_selected_peer_id, mapc_current_peer_idx % num_coordinated_aps);
++			mapc_selected_peer_id, mapc_current_peer_idx[mapc_active_group_idx] % num_coordinated_aps);
+ 	} else {
+ 		exchange_sequence = node_params.rts_cts_enabled ? IEEE_802_11_RTS_CTS : IEEE_802_11_NO_RTS_CTS;
+ 	}
+@@ -1301,6 +1328,7 @@
+ 	mapc_icr_received_count = 0;
+ 	SelectTdmaForTxop();
+ 
++	ObserveAp("access_won");
+ 	// Sergio on 26th June 2018:
+ 	// - Compute average BO waiting time
+ 	node_stats.sum_waiting_time = node_stats.sum_waiting_time + SimTime() - node_stats.timestamp_new_trial_started;
+@@ -1477,7 +1505,7 @@
+ 					"%.15f;N%d;S%d;%s;%s MU-RTS/TXS #%d tx finished. Advancing round-robin and restarting.\n",
+ 					SimTime(), node_params.node_id, node_state, LOG_G00, LOG_LVL2,
+ 					notification.packet_id);
+-				++mapc_current_peer_idx;
++				++mapc_current_peer_idx[mapc_active_group_idx];
+ 			++node_stats.num_mu_rts_tx;
+ 				if (dl_cfend.enabled && dl_cfend.round.valid()) HoldDlPeer();
+ 				else RestartNode(FALSE);
+@@ -1842,6 +1870,7 @@
+     // Reset the flag that indicates whether the tx power changed or not
+     sr_state.flag_change_in_tx_power = FALSE;
+ 
++	ObserveAp("tx_complete");
+ 	// LOGS(node_params.save_node_logs,node_logger.file, "%.15f;N%d;S%d;%s;%s  MyTxFinished()\n", SimTime(), node_params.node_id, node_state, LOG_G01, LOG_LVL1);
+ };
+ 
+@@ -2115,7 +2144,9 @@
+  */
+ void Node :: HandleFinishTX_StateRxIcr(const Notification &notification) {
+ 	if (notification.packet_type != PACKET_TYPE_ICR
+-			|| notification.destination_id != node_params.node_id) return;
++			|| notification.destination_id != node_params.node_id
++            || notification.source_id != mapc_selected_peer_id
++            || notification.mapc_group_id != wlan.mapc_group_ids[mapc_active_group_idx]) return;
+ 
+ 	++mapc_icr_received_count;
+ 	++node_stats.num_icr_rx;
+@@ -2129,6 +2160,7 @@
+ 	trigger_CTS_timeout.Cancel();
+ 	mapc_icr_received_count = 0;
+ 	mapc_peer_has_data = notification.mapc_has_data;
++	ObserveAp("icr_received", &notification);
+ 	// Save coordinated AP's requested duration for TXOP negotiation in ProceedAfterIcr
+ 	mapc_icr_requested_duration = notification.tx_info.mapc_allocated_data_duration;
+ 	ProceedAfterIcr();
+@@ -2455,6 +2487,7 @@
+ 		node_stats.total_mapc_data_duration_own += mapc_txop_per_ap_data_duration;
+ 		if (mapc_peer_has_data)
+ 			node_stats.total_mapc_data_duration_shared += mapc_txop_per_ap_data_duration;
++		ObserveAp("rule_allocation");
+ 		if (mapc_time_sharing_fallback) {
+ 			// Peer currently waits for TF, not MU-RTS. Negotiate the fallback explicitly
+ 			// before sending coordinator DATA; peer will wait for its sequential grant.
+@@ -2543,7 +2576,9 @@
+  */
+ void Node :: HandleFinishTX_StateRxMuRts(const Notification &notification) {
+ 	if (notification.packet_type != PACKET_TYPE_MU_RTS_TXS
+-			|| notification.destination_id != node_params.node_id) return;
++			|| notification.destination_id != node_params.node_id
++            || notification.source_id != coordinator_ap_id
++            || notification.mapc_group_id != wlan.mapc_group_ids[mapc_active_group_idx]) return;
+ 
+ 	LOGS(node_params.save_node_logs, node_logger.file,
+ 		"%.15f;N%d;S%d;%s;%s MU-RTS/TXS done, starting DATA exchange\n",
+@@ -2592,6 +2627,7 @@
+ 		mapc_txop_per_ap_data_duration = IEEE_AX_MAX_PPDU_DURATION;
+ 	++node_stats.num_mu_rts_rx;
+ 	node_stats.total_mapc_data_duration_allocated += mapc_txop_per_ap_data_duration;
++    ObserveAp("peer_grant_received", &notification);
+ 	PrepareNewTransmission();
+ }
+ 
+--- a/Code/methods/node/node_statistics_methods.h
++++ b/Code/methods/node/node_statistics_methods.h
+@@ -600,11 +600,12 @@
+ 	if (node_params.node_type == NODE_TYPE_AP) {
+ 		long unique = (long)tx_mpdu.acknowledged.size();
+ 		long balance = (long)node_stats.num_packets_generated - (long)node_stats.num_packets_dropped
+-			- unique - buffer.TotalQueueSize();
+-		printf("FIX_LEDGER;node=%d;generated=%d;overflow=%d;acked_unique=%ld;queue=%d;balance=%ld;acked=%d;delay_samples=%d\n",
++			- unique - buffer.TotalQueueSize() - (long)full_buffer_replaced;
++		printf("FIX_LEDGER;node=%d;generated=%d;overflow=%d;acked_unique=%ld;queue=%d;balance=%ld;acked=%d;delay_samples=%d;source_replaced=%lu\n",
+ 			node_params.node_id, (int)node_stats.num_packets_generated, (int)node_stats.num_packets_dropped,
+-			unique, buffer.TotalQueueSize(), balance, node_stats.data_frames_acked, node_stats.num_delay_measurements);
+-		if (node_params.traffic_model == TRAFFIC_POISSON && (balance != 0 || unique != node_stats.data_frames_acked))
++			unique, buffer.TotalQueueSize(), balance, node_stats.data_frames_acked, node_stats.num_delay_measurements, full_buffer_replaced);
++		if ((node_params.traffic_model == TRAFFIC_POISSON || node_params.traffic_model == TRAFFIC_FULL_BUFFER_NO_DIFFERENTIATION)
++				&& (balance != 0 || unique != node_stats.data_frames_acked))
+ 			throw std::runtime_error("MPDU generation/drop/ACK/queue conservation violated");
+ 	}
+ 	if (node_params.node_type == NODE_TYPE_AP) {
+--- a/Code/methods/node/node_timeout_methods.h
++++ b/Code/methods/node/node_timeout_methods.h
+@@ -25,6 +25,7 @@
+  * Handle the ACK timeout. It is called when ACK timeout is triggered.
+  */
+ void Node :: AckTimeout(trigger_t &){
++	ObserveAp("ack_timeout");
+ 
+ 	current_tx_duration += SIFS + TIME_OUT_EXTRA_TIME;		// Add ACK timeout to tx_duration
+ 
+@@ -84,6 +85,7 @@
+  * Handle the CTS timeout. It is called when CTS timeout is triggered (after sending RTS).
+  */
+ void Node :: CtsTimeout(trigger_t &){
++	ObserveAp("cts_timeout");
+ 
+ 	// MAPC Co-TDMA: ICR timeout — coordinated AP did not reply to ICF.
+ 	// The TXOP was grabbed fairly; continue with solo DATA instead of wasting it.
+@@ -152,6 +154,7 @@
+  * Handle the Data timeout. It is called when data timeout (after sending CTS) is triggered.
+  */
+ void Node :: DataTimeout(trigger_t &){
++	ObserveAp("data_timeout");
+ 
+ 	// In MAPC STATE_WAIT_TF the timeout means the TF frame from the coordinator did not arrive;
+ 	// this is not a DATA/RTS-CTS loss for this node, so skip packet-loss accounting.
+@@ -177,6 +180,7 @@
+  * Handle the NAV timeout. It is called when NAV timeout is triggered.
+  */
+ void Node :: NavTimeout(trigger_t &){
++	ObserveAp("nav_timeout");
+ 	if (dl_cfend.enabled) {
+ 		if (node_state==STATE_DL_CFEND_HOLD || node_state==STATE_TX_CFEND) return;
+ 		double end=dl_cfend.until(SimTime());
+--- a/Code/methods/utils/input_methods/input_loader.h
++++ b/Code/methods/utils/input_methods/input_loader.h
+@@ -579,6 +579,7 @@
+ 		if (print_system_logs) printf("\n%s Reading MAPC configuration file '%s'...\n", LOG_LVL1, mapc_filename);
+ 		char line[CHAR_BUFFER_SIZE];
+ 		int first_line_skipped = 0;
++        std::map<int,int> seen_group_ids;
+ 		char* tmp_line;
+ 
+ 		while (fgets(line, CHAR_BUFFER_SIZE, stream)) {
+@@ -586,7 +587,10 @@
+ 			tmp_line = strdup(line);
+ 			// 1. Parse Group ID and Method
+ 			int group_id = atoi(GetField(tmp_line, IX_MAPC_GROUP_ID));
+-			// 2. Parse the MAPC scheme
++			if (group_id<=0 || seen_group_ids.count(group_id))
++                throw std::runtime_error("MAPC group IDs must be positive and unique");
++            seen_group_ids[group_id]=1;
++            // 2. Parse the MAPC scheme
+ 			tmp_line = strdup(line);
+ 			std::string method_str = ToString(GetField(tmp_line, IX_MAPC_METHOD));
+ 			int method_id = 0; 
+@@ -599,7 +603,8 @@
+ 			} else if (method_str == "CO_RTWT") {
+ 				method_id = CO_RTWT;
+ 			}
+-			// 3. Parse coordinated APs (handle comma-separated list)
++			if (method_id==0) throw std::runtime_error("Unknown MAPC method");
++            // 3. Parse coordinated APs (handle comma-separated list)
+ 			tmp_line = strdup(line);
+ 			std::string coordinated_ids_str = ToString(GetField(tmp_line, IX_MAPC_AP_IDS));
+ 			// Use string comparison so wlan_codes like "A","B" match correctly.
+@@ -610,7 +615,22 @@
+ 				coordinated_ap_list.push_back(std::string(token));
+ 				token = strtok(NULL, ",");
+ 			}
+-			// Update MAPC information of involved WLANs
++			if (coordinated_ap_list.size()<2)
++                throw std::runtime_error("MAPC groups require at least two distinct BSSs");
++            for (size_t c=0;c<coordinated_ap_list.size();++c) {
++                bool found=false;
++                for (size_t previous=0;previous<c;++previous)
++                    if (coordinated_ap_list[previous]==coordinated_ap_list[c])
++                        throw std::runtime_error("Duplicate BSS in MAPC group");
++                for (int w=0;w<total_wlans_number;++w)
++                    if (wlan_container[w].wlan_code==coordinated_ap_list[c]) {
++                        found=true;
++                        if (wlan_container[w].num_mapc_groups>=MAX_MAPC_GROUPS_PER_WLAN)
++                            throw std::runtime_error("MAPC groups per BSS exceed supported limit");
++                    }
++                if (!found) throw std::runtime_error("Unknown BSS in MAPC group");
++            }
++            // Update MAPC information of involved WLANs
+ 			for (size_t c = 0; c < coordinated_ap_list.size(); ++c) {
+ 				for (int w = 0; w < total_wlans_number; ++w) {
+ 					if (wlan_container[w].wlan_code == coordinated_ap_list[c]) {
+--- /dev/null
++++ b/Code/structures/ap_observation.h
+@@ -0,0 +1,102 @@
++// Local-only AP telemetry. No shared queues, policy, simulator time or RNG access.
++#ifndef KOMONDOR_AP_OBSERVATION_H
++#define KOMONDOR_AP_OBSERVATION_H
++#include <cstdio>
++#include <cstdlib>
++#include <sstream>
++#include <iomanip>
++#include <string>
++#include <stdexcept>
++#include <limits>
++#include <fcntl.h>
++#include <unistd.h>
++
++inline std::string ApJsonString(const std::string &value) {
++    std::ostringstream out; out << (char)34;
++    const char *hex="0123456789abcdef";
++    for (std::string::size_type i=0;i<value.size();++i) {
++        unsigned char c=(unsigned char)value[i];
++        if (c==34 || c==92) out << (char)92 << (char)c;
++        else if (c<32) out << (char)92 << "u00" << hex[c>>4] << hex[c&15];
++        else out << (char)c;
++    }
++    out << (char)34; return out.str();
++}
++inline std::string ApJsonNumber(double value) {
++    if (!(value==value) || value>std::numeric_limits<double>::max()
++            || value<-std::numeric_limits<double>::max()) return "null";
++    std::ostringstream out; out << std::setprecision(17) << value; return out.str();
++}
++inline const char *ApStateName(int state) {
++    switch(state) {
++        case STATE_DL_CFEND_HOLD: return "STATE_DL_CFEND_HOLD";
++        case STATE_TX_CFEND: return "STATE_TX_CFEND";
++        case STATE_UNKNOWN: return "STATE_UNKNOWN";
++        case STATE_SENSING: return "STATE_SENSING";
++        case STATE_TX_DATA: return "STATE_TX_DATA";
++        case STATE_RX_DATA: return "STATE_RX_DATA";
++        case STATE_WAIT_ACK: return "STATE_WAIT_ACK";
++        case STATE_TX_ACK: return "STATE_TX_ACK";
++        case STATE_RX_ACK: return "STATE_RX_ACK";
++        case STATE_TX_RTS: return "STATE_TX_RTS";
++        case STATE_TX_CTS: return "STATE_TX_CTS";
++        case STATE_RX_RTS: return "STATE_RX_RTS";
++        case STATE_RX_CTS: return "STATE_RX_CTS";
++        case STATE_WAIT_CTS: return "STATE_WAIT_CTS";
++        case STATE_WAIT_DATA: return "STATE_WAIT_DATA";
++        case STATE_NAV: return "STATE_NAV";
++        case STATE_SLEEP: return "STATE_SLEEP";
++        case STATE_TX_ICF: return "STATE_TX_ICF";
++        case STATE_WAIT_ICR: return "STATE_WAIT_ICR";
++        case STATE_TX_TF: return "STATE_TX_TF";
++        case STATE_RX_ICF: return "STATE_RX_ICF";
++        case STATE_RX_ICR: return "STATE_RX_ICR";
++        case STATE_TX_ICR: return "STATE_TX_ICR";
++        case STATE_WAIT_MU_RTS: return "STATE_WAIT_MU_RTS";
++        case STATE_RX_MU_RTS: return "STATE_RX_MU_RTS";
++        case STATE_WAIT_TF: return "STATE_WAIT_TF";
++        case STATE_RX_TF: return "STATE_RX_TF";
++        case STATE_TX_ACK_TF: return "STATE_TX_ACK_TF";
++        case STATE_WAIT_ACK_TF: return "STATE_WAIT_ACK_TF";
++        case STATE_TX_DSO_ICF: return "STATE_TX_DSO_ICF";
++        case STATE_RX_DSO_ICR: return "STATE_RX_DSO_ICR";
++        case STATE_TX_DATA_DSO: return "STATE_TX_DATA_DSO";
++        case STATE_WAIT_ACK_DSO: return "STATE_WAIT_ACK_DSO";
++        case STATE_TX_NPCA_ICF: return "STATE_TX_NPCA_ICF";
++        case STATE_RX_NPCA_ICR: return "STATE_RX_NPCA_ICR";
++        case STATE_TX_DATA_NPCA: return "STATE_TX_DATA_NPCA";
++        case STATE_WAIT_ACK_NPCA: return "STATE_WAIT_ACK_NPCA";
++        case STATE_TX_NPCA_ICR: return "STATE_TX_NPCA_ICR";
++        default: return "STATE_UNRECOGNIZED";
++    }
++}
++struct ApObservation {
++    FILE *stream;
++    unsigned long sequence;
++    int report_source;
++    double report_time_s;
++    bool report_has_data;
++    bool allocation_valid;
++    ApObservation() : stream(NULL), sequence(0), report_source(-1), report_time_s(-1), report_has_data(false), allocation_valid(false) {}
++    ~ApObservation() { close(); }
++    bool enabled() const { return stream!=NULL; }
++    void open(int node_id) {
++        const char *directory=std::getenv("KOMONDOR_AP_STATE_DIR");
++        if (!directory) return;
++        std::ostringstream path; path << directory << "/ap_" << node_id << ".jsonl";
++        int fd=::open(path.str().c_str(),O_WRONLY|O_CREAT|O_EXCL,0666);
++        if (fd<0) throw std::runtime_error("Cannot create independent AP state file: "+path.str());
++        stream=fdopen(fd,"w");
++        if (!stream) { ::close(fd); throw std::runtime_error("Cannot open AP state stream"); }
++    }
++    void write(const std::string &fields) {
++        if (!stream) return;
++        std::ostringstream line;
++        line << "{\"schema\":\"komondor.ap_state.v1\",\"sequence\":" << sequence++ << ',' << fields << "}\n";
++        std::string text=line.str();
++        if (fwrite(text.data(),1,text.size(),stream)!=text.size() || fflush(stream)!=0)
++            throw std::runtime_error("Cannot write AP state stream");
++    }
++    void close() { if (stream) { fclose(stream); stream=NULL; } }
++};
++#endif

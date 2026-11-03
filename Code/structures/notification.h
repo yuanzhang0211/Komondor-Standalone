@@ -1,0 +1,200 @@
+/* Kom8ndor IEEE 802.11bn Simulator
+ *
+ * Copyright (c) 2026, Universitat Pompeu Fabra.
+ * GNU GENERAL PUBLIC LICENSE
+ * Version 3, 29 June 2007
+
+ * Copyright (C) 2007 Free Software Foundation, Inc. <http://fsf.org/>
+ * Everyone is permitted to copy and distribute verbatim copies
+ * of this license document, but changing it is not allowed.
+ * 
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the Institute nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE INSTITUTE AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE INSTITUTE OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ *
+ * -----------------------------------------------------------------
+ *
+ * Author  : Sergio Barrachina-Muñoz and Francesc Wilhelmi
+ * Created : 2016-12-05
+ * Updated : $Date: 2017/03/20 10:32:36 $
+ *           $Revision: 1.0 $
+ *
+ * -----------------------------------------------------------------
+ */
+
+ /**
+ * notification.h: this file defines a NOTIFICATION and provides basic displaying methods
+ */
+
+#ifndef _AUX_NOTIFICATION_
+#define _AUX_NOTIFICATION_
+#include "dl_cfend.h"
+
+// Notification specific info (may be not checked by the other nodes)
+struct TxInfo
+{
+    DlRound dl_round; // Simulator metadata: exact reservation provenance, not extra wire bytes.
+
+	int num_packets_aggregated;				///> Number of MPDUs aggregated in this A-MPDU
+	int *list_id_aggregated;				///> List of MPDU IDs in this A-MPDU
+	double *timestamp_frames_aggregated;	///> Timestamps of each aggregated MPDU
+
+	// For RTS/CTS management
+	double data_duration;		///> Duration of the DATA frame (A-MPDU)
+	double ack_duration;		///> Duration of the ACK packet
+	double rts_duration;		///> Duration of the RTS packet
+	double cts_duration;		///> Duration of the CTS packet
+
+	double preoccupancy_duration;	///>
+	double total_tx_power;			///> Transmission power [pW]
+	double tx_power;				///> Transmission power per 20 MHz channel [pW]
+	double tx_gain;					///> Transmission gain [linear ratio]
+	double pd;						///> PD threshold in [pW]
+	double bits_ofdm_sym; 			///> Bits per OFDM symbol
+	double data_rate; 				///> Rate at which data is transmitted
+	int modulation_schemes[NUM_OPTIONS_CHANNEL_LENGTH];		///> All supported bandwidth classes
+	double x;						///> X position of source node
+	double y;						///> Y position of source node
+	double z;						///> Z position of source node
+	double nav_time;				///> RTS/CTS NAV time
+	double mapc_allocated_data_duration;	///> MAPC TXOP split: per-AP data duration allocated by coordinator
+	double mapc_sr_peer_tx_power;		///> Co-SR: TX power limit for peer AP [pW] (carried in TF)
+	double mapc_sr_measured_rssi;		///> Co-SR Option B placeholder: RSSI from peer's STA [pW]; 0 = unused
+	bool mapc_time_sharing_fallback; // Explicit per-TXOP execution choice carried by TF/DATA/MU-RTS.
+
+	// Preamble puncturing (802.11ax)
+	int pp_punctured_bitmap;		///> Bitmask of punctured 20-MHz sub-channels (bit i=1 means channel i carries no power); 0 = no puncturing
+
+	// Beamforming parameters (set per-TXOP by transmitter; receiver uses these to compute its own gain)
+	int    beamforming_active;			///> 0 = omni, 1 = ULA beam pattern applies
+	int    beam_N_elements;				///> Number of ULA elements
+	double beam_d_spacing;				///> Element spacing [wavelengths]
+	double beam_az_main_rad;			///> Main beam azimuth [rad] for this TX
+	int    beam_num_nulls;				///> Number of steered nulls
+	double beam_null_az_rad[MAX_BEAM_NULLS];	///> Null azimuth directions [rad]
+	int    beam_use_zf;				///> 0 = projection null-steering (standalone BF), 1 = ZF precoding (Co-BF)
+
+	bool flag_change_in_tx_power;	///> Flag to indicate whether the transmission power was changed (in order to recompute arrays)
+
+	// Spatial Reuse
+	int bss_color;				///> BSS color
+	int srg;					///> Spatial Reuse Group
+	bool txop_sr_identified;	///> Boolean indicating whether an SR-based TXOP has been detected or not
+	// DSO (Dynamic Subband Operation)
+	int dso_tx;            ///> 1 = frame belongs to a DSO TXOP; 0 = normal
+	int dso_subband_left;  ///> Left channel of DSO secondary subband
+	int dso_subband_right; ///> Right channel of DSO secondary subband
+
+	// Adaptive ACK suppression
+	int ack_required;	///> 1 = receiver must send ACK; 0 = ACK suppressed by transmitter
+
+	// Co-BF/Co-SR sequential ACK: lets the receiving STA compute the right ACK-TF wait timeout. 
+	//   --> 1 = sender is the MAPC coordinator (send ACK TF after SIFS)
+	//   --> 0 = sender is the coordinated AP (wait SIFS+ACK-TF+SIFS+ACK)
+	int mapc_is_coordinator_tx;
+	int tdma_peer_sta, tdma_coord_us, tdma_peer_us; // Experimental pilot grant/STA fields.
+
+	/**
+	 * Function to print the transmission information
+	 * @param "packet_id" [type int]: identifier of the packet
+	 * @param "destination_id" [type int]: identifier of the destination node
+	 * @param "tx_duration" [type double]: transmission duration
+	 */
+	void PrintTxInfo(int packet_id, int destination_id, double tx_duration){
+		printf("packet_id = %d - destination_id = %d - tx_duration = %f - tx_power = %f pw"
+			" - position = (%.2f, %.2f, %.2f)\n",
+			packet_id, destination_id, tx_duration, tx_power, x, y, z);
+	}
+
+	/**
+	 * Set the size of the array list_id_aggregated
+	 * @param "num_packets_aggregated" [type int]: number of packets aggregated
+	 */
+	void SetSizeOfIdsAggregatedArray(int num_packets_aggregated){
+		list_id_aggregated = new int[num_packets_aggregated];
+		for(int t = 0; t < num_packets_aggregated; ++t){
+			list_id_aggregated[t] = 0;
+		}
+	}
+
+	/**
+	 * Set the size of the array timestamp_frames_aggregated
+	 * @param "num_packets_aggregated" [type int]: number of packets aggregated
+	 */
+	void SetSizeOfTimestampAggregatedArray(int num_packets_aggregated){
+		timestamp_frames_aggregated = new double[num_packets_aggregated];
+		for(int t = 0; t < num_packets_aggregated; ++t){
+			timestamp_frames_aggregated[t] = 0;
+		}
+	}
+
+	/**
+	 * Set the size of the array modulation_schemes
+	 * @param "channels_groups" [type int]: groups of channels that can be used
+	 */
+	void SetSizeOfMCS(int channels_groups){
+		//modulation_schemes = new int[channels_groups];
+		for(int s = 0; s < channels_groups; ++s){
+			modulation_schemes[s] = MODULATION_NONE;
+		}
+	}
+
+};
+
+// Notification info
+struct Notification
+{
+	int paper_ac, paper_flow, paper_application, paper_data_bits;
+	std::vector<int> paper_ids, paper_payload_bits, paper_flows;
+	std::vector<double> paper_generated;
+	// Always read in destination
+	int packet_id;				///> Packet identifier of the first frame
+	int packet_type;			///> Type of packet: Data, ACK, etc.
+	int source_id;				///> Node id of the source
+	int destination_id;			///> Destination node of the transmission
+	double tx_duration;			///> Duration of the transmission
+	int left_channel;			///> Left channel used in the transmission
+	int right_channel;			///> Right channel used in the transmission
+	int frame_length;			///> Size of the packet to transmit
+	int modulation_id;			///> Modulation being used during the transmission
+	double timestamp;			///> Timestamp when notification is sent
+	double timestamp_generated;	///> Timestamp when notification was generated
+	int mapc_group_id;			///> MAPC group ID (0 = standard frame; >0 = group-addressed MAPC)
+	int mapc_target_ap_id;		///> For ICF: node_id of the ONE coordinated AP that should respond with ICR (-1 = all)
+	int mapc_has_data;			///> ICR: TRUE if coordinated AP has data to send in this TXOP
+	TxInfo tx_info; 			///> Specific transmission info (may not be checked by the others nodes)
+
+	/**
+	 * Function to print the parameters of a notification
+	 */
+	void PrintNotification(void){
+		printf("source_id = %d - packet_type = %d - left_channel = %d - right_channel = %d - pkt_length = %d -",
+			source_id, packet_type, left_channel, right_channel, frame_length);
+		printf("tx_info: ");
+		tx_info.PrintTxInfo(packet_id, destination_id, tx_duration);
+	}
+
+};
+
+#endif

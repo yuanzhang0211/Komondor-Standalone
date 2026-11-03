@@ -1,0 +1,177 @@
+{
+  "schema": "standalone-maintenance-cleanup-v1",
+  "date": "2026-11-03",
+  "scope": "Runs, outdated/redundant local Markdown and gitignore; no simulator source or upstream material changes.",
+  "reference_policy": "Preserve current report evidence; historical original_sanitized_evidence is relative to its old build copy, and cleanup records are not current evidence references.",
+  "runs_bytes_before": 249752893,
+  "runs_bytes_after": 106831132,
+  "runs_bytes_removed": 142921761,
+  "deleted_run_directories": [
+    {
+      "path": "runs/20261103_144612_046454",
+      "action": "delete",
+      "bytes": 407336,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 7
+    },
+    {
+      "path": "runs/20261103_155817_201297",
+      "action": "delete",
+      "bytes": 177021,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 8
+    },
+    {
+      "path": "runs/20261103_160434_303900",
+      "action": "delete",
+      "bytes": 129198,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 11
+    },
+    {
+      "path": "runs/20261103_160838_827850",
+      "action": "delete",
+      "bytes": 2966197,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 10
+    },
+    {
+      "path": "runs/20261103_161010_015584",
+      "action": "delete",
+      "bytes": 2935976,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 10
+    },
+    {
+      "path": "runs/20261103_163541_023515",
+      "action": "delete",
+      "bytes": 5178395,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 10
+    },
+    {
+      "path": "runs/basic_native_20261103_161319_245211",
+      "action": "delete",
+      "bytes": 2990267,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 22
+    },
+    {
+      "path": "runs/basic_native_20261103_161515_091011",
+      "action": "delete",
+      "bytes": 28075106,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 123
+    },
+    {
+      "path": "runs/basic_native_20261103_161854_920156",
+      "action": "delete",
+      "bytes": 49662677,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 155
+    },
+    {
+      "path": "runs/basic_native_20261103_162041_102612",
+      "action": "delete",
+      "bytes": 49662677,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 155
+    },
+    {
+      "path": "runs/initial_bf",
+      "action": "delete",
+      "bytes": 164771,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 6
+    },
+    {
+      "path": "runs/initial_sr",
+      "action": "delete",
+      "bytes": 164828,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 6
+    },
+    {
+      "path": "runs/initial_tdma",
+      "action": "delete",
+      "bytes": 407312,
+      "reason": "Unreferenced intermediate, duplicate, failed, or ad hoc smoke run",
+      "referenced_by": [],
+      "file_count": 7
+    }
+  ],
+  "retained_run_directories": [
+    {
+      "path": "runs/basic_native_20261103_162837_229093",
+      "action": "keep",
+      "bytes": 53053032,
+      "reason": "Referenced current validation evidence",
+      "referenced_by": [
+        "basic_native_reference_check.json",
+        "basic_native_validation.json"
+      ]
+    },
+    {
+      "path": "runs/native_rule_reference_20261103_163320_409987",
+      "action": "keep",
+      "bytes": 43069,
+      "reason": "Referenced current validation evidence",
+      "referenced_by": [
+        "basic_native_reference_check.json"
+      ]
+    },
+    {
+      "path": "runs/official_restore_20261103_152816_641096",
+      "action": "keep",
+      "bytes": 681296,
+      "reason": "Referenced current validation evidence",
+      "referenced_by": [
+        "restored_materials_validation.json"
+      ]
+    },
+    {
+      "path": "runs/sanitized_basic_native_20261103_163030_244733",
+      "action": "keep",
+      "bytes": 53053735,
+      "reason": "Referenced current validation evidence",
+      "referenced_by": [
+        "basic_native_sanitizer.json"
+      ]
+    }
+  ],
+  "deleted_markdown": [
+    {
+      "path": "docs/EXTRACTION.md",
+      "sha256": "8d70dd9f7ca24fce9bf1127323d9712edae67b3ec395260143fce5fe66ee6fce",
+      "reason": "Obsolete initial extraction narrative; unique source facts merged into DIRECTORY_LAYOUT.md"
+    },
+    {
+      "path": "docs/BASIC_NATIVE_COTDMA_REPORT.md",
+      "sha256": "8483291f216542dc1f8d620a4234d2e86b202ec428d2d6256f3c4cecdbcf0974",
+      "reason": "Duplicates current native Co-TDMA guide; validation summary merged into BASIC_NATIVE_COTDMA.md"
+    }
+  ],
+  "upstream_markdown": "Preserved byte-for-byte, except the already-local root README navigation.",
+  "verification": {
+    "inventory": "passed",
+    "gitignore_preserved_official_files": 846,
+    "artifact_ignore_cases": 16,
+    "local_markdown_files_checked": 12,
+    "local_links_checked": 1194,
+    "current_evidence_references_checked": 74,
+    "official_markdown_unchanged": true,
+    "native_source_unchanged": true
+  }
+}

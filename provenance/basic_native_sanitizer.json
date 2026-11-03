@@ -1,0 +1,186 @@
+{
+  "schema": "basic-native-cotdma-validation-v1",
+  "cases": [
+    {
+      "case": "official_2ap_observed",
+      "ap_count": 2,
+      "duration_s": 0.05,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/official_2ap_observed",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/official_2ap_observed"
+    },
+    {
+      "case": "official_2ap_unobserved",
+      "ap_count": 2,
+      "duration_s": 0.05,
+      "seed": 1,
+      "passed": true,
+      "observed": false,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/official_2ap_unobserved",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/official_2ap_unobserved"
+    },
+    {
+      "case": "official_2ap_repeat",
+      "ap_count": 2,
+      "duration_s": 0.05,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/official_2ap_repeat",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/official_2ap_repeat"
+    },
+    {
+      "case": "traffic_1_seed_1",
+      "ap_count": 2,
+      "duration_s": 0.2,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/traffic_1_seed_1",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/traffic_1_seed_1"
+    },
+    {
+      "case": "traffic_1_seed_7",
+      "ap_count": 2,
+      "duration_s": 0.2,
+      "seed": 7,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/traffic_1_seed_7",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/traffic_1_seed_7"
+    },
+    {
+      "case": "traffic_2_seed_1",
+      "ap_count": 2,
+      "duration_s": 0.2,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/traffic_2_seed_1",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/traffic_2_seed_1"
+    },
+    {
+      "case": "traffic_2_seed_7",
+      "ap_count": 2,
+      "duration_s": 0.2,
+      "seed": 7,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/traffic_2_seed_7",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/traffic_2_seed_7"
+    },
+    {
+      "case": "traffic_3_seed_1",
+      "ap_count": 2,
+      "duration_s": 0.2,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/traffic_3_seed_1",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/traffic_3_seed_1"
+    },
+    {
+      "case": "traffic_3_seed_7",
+      "ap_count": 2,
+      "duration_s": 0.2,
+      "seed": 7,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/traffic_3_seed_7",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/traffic_3_seed_7"
+    },
+    {
+      "case": "empty_peer",
+      "ap_count": 2,
+      "duration_s": 0.25,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/empty_peer",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/empty_peer"
+    },
+    {
+      "case": "packet_loss",
+      "ap_count": 2,
+      "duration_s": 0.25,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/packet_loss",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/packet_loss"
+    },
+    {
+      "case": "narrow_peer",
+      "ap_count": 2,
+      "duration_s": 0.25,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/narrow_peer",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/narrow_peer"
+    },
+    {
+      "case": "four_aps_variable_sta_ids",
+      "ap_count": 4,
+      "duration_s": 0.3,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/four_aps_variable_sta_ids",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/four_aps_variable_sta_ids"
+    },
+    {
+      "case": "overlapping_groups",
+      "ap_count": 4,
+      "duration_s": 0.5,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/overlapping_groups",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/overlapping_groups"
+    },
+    {
+      "case": "ten_aps_nine_peers",
+      "ap_count": 10,
+      "duration_s": 0.5,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/ten_aps_nine_peers",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/ten_aps_nine_peers"
+    },
+    {
+      "case": "native_without_mapc",
+      "ap_count": 2,
+      "duration_s": 0.05,
+      "seed": 1,
+      "passed": true,
+      "observed": true,
+      "evidence": "runs/sanitized_basic_native_20261103_163030_244733/native_without_mapc",
+      "original_sanitized_evidence": "runs/basic_native_20261103_163030_244733/native_without_mapc"
+    }
+  ],
+  "case_count": 16,
+  "observation_does_not_change_protocol": true,
+  "per_ap_local_streams": true,
+  "no_demand_policy_or_agent": true,
+  "scope": "Native equal-split/round-robin and local observations; not a live Agent action interface or full standard conformance.",
+  "profile": "sanitize",
+  "ASAN_OPTIONS": "detect_leaks=0",
+  "UBSAN_OPTIONS": "halt_on_error=1",
+  "leak_check": "Disabled: upstream lifetime allocations are outside this targeted bounds/UB check.",
+  "build_config": {
+    "CPPFLAGS": "",
+    "CXXFLAGS": "-O1 -g -Wall -std=c++98 -fsanitize=address,undefined -fno-omit-frame-pointer",
+    "LDFLAGS": "",
+    "PROFILE": "sanitize",
+    "compiler": [
+      "g++"
+    ],
+    "compiler_path": "/usr/bin/g++",
+    "compiler_version": "g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"
+  },
+  "native_source_matches_release": true
+}

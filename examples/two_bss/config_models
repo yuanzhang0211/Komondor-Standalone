@@ -1,0 +1,4 @@
+path_loss_model=13
+adjacent_channel_model=0
+collisions_model=0
+simulation_ix_output_script=9

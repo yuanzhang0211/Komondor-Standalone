@@ -1,0 +1,23 @@
+{
+  "system": "Linux",
+  "architecture": "x86_64",
+  "os_release": "PRETTY_NAME=\"Ubuntu 22.04.5 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"22.04\"\nVERSION=\"22.04.5 LTS (Jammy Jellyfish)\"\nVERSION_CODENAME=jammy\nID=ubuntu\nID_LIKE=debian\nHOME_URL=\"https://www.ubuntu.com/\"\nSUPPORT_URL=\"https://help.ubuntu.com/\"\nBUG_REPORT_URL=\"https://bugs.launchpad.net/ubuntu/\"\nPRIVACY_POLICY_URL=\"https://www.ubuntu.com/legal/terms-and-policies/privacy-policy\"\nUBUNTU_CODENAME=jammy\n",
+  "python": "3.10.12",
+  "python_executable": "/usr/bin/python3",
+  "make": "GNU Make 4.3",
+  "flex": null,
+  "generator_sha256": "da6babb6c208bee1e6eac25bc2d450624e2e51a3e76ee34b34c0fce90e3705c5",
+  "settings": {
+    "PROFILE": "release",
+    "CXXFLAGS": "-O2 -g -Wall -std=c++98",
+    "CPPFLAGS": "",
+    "LDFLAGS": "",
+    "compiler": [
+      "g++"
+    ],
+    "compiler_path": "/usr/bin/g++",
+    "compiler_version": "g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"
+  },
+  "compiler_probe_passed": true,
+  "scope": "Toolchain availability check; simulator correctness requires make test."
+}

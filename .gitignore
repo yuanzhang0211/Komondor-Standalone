@@ -1,0 +1,47 @@
+# Runtime evidence and local build copies/reports (root only).
+/runs/
+/build/
+
+# Native simulator and COST-generated files; keep the actual .cc/.h sources.
+/Code/main/komondor_main
+/Code/main/komondor_main.exe
+/Code/main/komondor_main.cxx
+/Code/main/compcxx_komondor_main.h
+/Code/main/.build-config
+/Code/main/.build-config.tmp
+/Code/main/*.o
+/Code/main/*.obj
+/Code/main/*.d
+
+# Generated compiler build output. Code/COST/cxx is a required bundled tool.
+/Code/compcpp/cxx
+/Code/compcpp/cxx.exe
+/Code/compcpp/lexer.cpp
+/Code/compcpp/*.o
+/Code/compcpp/*.obj
+
+# Original output directory stays present, with only its marker in source control.
+/Code/output/*
+!/Code/output/.gitkeep
+
+# Python/tool caches and optional local environments.
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.ruff_cache/
+/.mypy_cache/
+/.coverage
+/htmlcov/
+/.venv/
+/venv/
+
+# Local editor/OS temporary files.
+/.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Do not globally ignore .csv/.json/.jsonl/.md/.patch/.jar/.class/.properties,
+# or nested build directories: upstream Apps ships files of these kinds.

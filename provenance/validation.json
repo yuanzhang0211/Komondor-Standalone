@@ -1,0 +1,52 @@
+{
+  "native_unit_tests": 4,
+  "relocated_clean_build": true,
+  "no_symlinks": true,
+  "header_dependency_tracking": true,
+  "preserved_official_materials_in_relocated_copy": true,
+  "runtime_cases": [
+    {
+      "mode": "none",
+      "traffic": "replay",
+      "policy": "equal_txs",
+      "passed": true
+    },
+    {
+      "mode": "tdma",
+      "traffic": "replay",
+      "policy": "equal_txs",
+      "passed": true
+    },
+    {
+      "mode": "tdma",
+      "traffic": "replay",
+      "policy": "dl_ll_demand",
+      "passed": true
+    },
+    {
+      "mode": "none",
+      "traffic": "native",
+      "policy": "equal_txs",
+      "passed": true
+    },
+    {
+      "mode": "tdma",
+      "traffic": "native",
+      "policy": "equal_txs",
+      "passed": true
+    },
+    {
+      "mode": "sr",
+      "traffic": "native",
+      "policy": "equal_txs",
+      "passed": true
+    },
+    {
+      "mode": "bf",
+      "traffic": "native",
+      "policy": "equal_txs",
+      "passed": true
+    }
+  ],
+  "scope": "Engineering smoke/invariants; SR/BF PHY correctness is not validated."
+}
